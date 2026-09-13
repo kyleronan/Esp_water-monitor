@@ -41,6 +41,7 @@ from .config import DB_PATH, pump_gates_active, pump_gates_active as _pga
 from .database import (
     drain_daily_summary_dirty,
     find_overlapping_event,
+    get_absent_fixture_types,
     get_circuit_type,
     get_home_profile,
     get_sensitivity_config,
@@ -1206,6 +1207,16 @@ class FeatureExtractor:
         washer_members: dict = {}
         softener_members: dict = {}
         dishwasher_members: dict = {}
+        # The fixture checklist, read FRESH like the softener profile below so
+        # a Settings save takes effect on the next event. A type the home says
+        # it lacks skips its cycle detector and, whatever tier proposes it, is
+        # withheld after the veto (an abstain, which reads as Other).
+        try:
+            _absent = get_absent_fixture_types(self._db)
+        except Exception as e:                                # noqa: BLE001
+            log.warning("[%s] fixture checklist unavailable (non-fatal): %s",
+                        circuit, e)
+            _absent = frozenset()
         try:
             from .event_rules import (
                 WASHER_FAMILY_PK_ENVELOPE, detect_dishwasher_cycles,
@@ -1238,7 +1249,8 @@ class FeatureExtractor:
                         self._db, circuit, band, since_ts=s_since,
                         tz=(get_home_timezone() or self._ha_tz), calib=calib)
             pk = features.get("peak_flow_lpm")
-            if (ctype != "zone" and pk is not None
+            if (ctype != "zone" and "washing_machine" not in _absent
+                    and pk is not None
                     and WASHER_FAMILY_PK_ENVELOPE[0] <= pk
                     <= WASHER_FAMILY_PK_ENVELOPE[1]):
                 since = (datetime.now(timezone.utc)
@@ -1256,7 +1268,8 @@ class FeatureExtractor:
             _dw_vol_hi = float(_rule_cv(calib, "DW_VOL_L")[1]) * 1.4
             _dw_pk_hi = float(_rule_cv(calib, "DW_MAX_PK_LPM")) * 1.4
             vol = features.get("volume_litres")
-            if (ctype != "zone" and event_id not in softener_members
+            if (ctype != "zone" and "dishwasher" not in _absent
+                    and event_id not in softener_members
                     and event_id not in washer_members
                     and pk is not None and pk <= max(5.0, _dw_pk_hi)
                     and vol is not None and 0.0 < vol <= max(5.0, _dw_vol_hi)):
@@ -1420,6 +1433,15 @@ class FeatureExtractor:
             except Exception as e:
                 log.warning("[%s] toilet physics veto failed (non-fatal): %s",
                             circuit, e)
+
+        # Fixture checklist: never name a fixture this home says it lacks.
+        # Withheld, not re-guessed (the veto's rule) — it reads as Other until
+        # the box is ticked again, and the batch pass re-derives it then.
+        if matched_fixture_type is not None and matched_fixture_type in _absent:
+            log.info("[%s] event %s: %s (%s) withheld — not in this home's "
+                     "fixture checklist", circuit, event_id,
+                     matched_fixture_type, matched_via)
+            matched_fixture_type, matched_via = None, None
 
         # Score the event against the FROZEN baseline now that its type is
         # known, and persist the verdict. Stashed on `features` so the _process

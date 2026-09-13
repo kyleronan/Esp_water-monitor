@@ -25,6 +25,7 @@ from ..database import (
     expire_stale_training_captures,
     extend_training_capture,
     finish_job,
+    get_absent_fixture_types,
     get_active_training_capture,
     get_circuit_type,
     get_training_checklist,
@@ -52,12 +53,14 @@ _INSTANT_TYPES = ("toilet", "tap")
 
 def _applicable_types(orch, circuit) -> list:
     """The wizard checklist types for a circuit: its user-selectable types,
-    restricted to the ones the helper can capture (drops 'other')."""
+    restricted to the ones the helper can capture (drops 'other') and to the
+    fixtures the home says it has (Settings → Dev Tools checklist)."""
     kind = get_circuit_type(orch.db, circuit)
     base = (zone_user_selectable_types() if kind == "zone"
             else fixture_user_selectable_types())
     cap = training_capturable_types()
-    return [t for t in base if t in cap]
+    absent = get_absent_fixture_types(orch.db)
+    return [t for t in base if t in cap and t not in absent]
 
 
 # A startup or import reclassify holds the write lock for minutes; the

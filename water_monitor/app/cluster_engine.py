@@ -14,7 +14,8 @@ import math
 import threading
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
-from .database import cycle_pulse_count_for_event, merge_clusters, run_db
+from .database import (cycle_pulse_count_for_event, get_absent_fixture_types,
+                       merge_clusters, run_db)
 
 # `river` is deferred to ClusterEngine.__init__ (_load_river): importing it
 # eagerly pulls in scipy (~1.3 s), nothing outside the engine needs it
@@ -628,6 +629,10 @@ class ClusterEngine:
             from .fixtures import suggest_fixture_type
             old_type = row["suggested_type"]
             suggested_type, confidence = suggest_fixture_type(centroid, circuit_type)
+            # The fixture checklist: a type the home says it lacks is never
+            # suggested (and so never triggers the same-type auto-merge).
+            if suggested_type in get_absent_fixture_types(self._db):
+                suggested_type, confidence = None, 0.0
             # Sprint B: only overwrite when the existing suggestion was
             # NULL or heuristic. A user-labels suggestion is a stronger
             # signal than the centroid heuristic and must not be silently

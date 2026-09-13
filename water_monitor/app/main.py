@@ -373,6 +373,9 @@ async def lifespan(app: FastAPI):
         "tap":             "\U0001F6B0",  # 🚰
         "washing_machine": "\U0001F455",  # 👕
         "dishwasher":      "\U0001F37D",  # 🍽
+        "ice_maker":       "\U0001F9CA",  # 🧊
+        "humidifier":      "\U0001F4A8",  # 💨
+        "hose_bib":        "\U0001F33F",  # 🌿
         "irrigation_zone": "\U0001F4A7",  # 💧
         "other":           "❓",
         "leak_test":       "\U0001F50D",  # 🔍

@@ -522,6 +522,8 @@ async def settings_page(request: Request):
         "dev_tools": DEV_TOOLS,
         "benchmark_status": benchmark_status,
         "overlap_repair": overlap_repair,
+        "fixture_checklist": (_fixture_checklist_rows(_profile, circuits)
+                              if DEV_TOOLS else []),
         "pump_floor": pump_floor,
         "supply_regime": supply_regime_ctx,
         "profile": _profile,
@@ -538,6 +540,33 @@ async def settings_page(request: Request):
         "zone_only_alert_types": ZONE_ONLY_ALERT_TYPES,
         "page": "settings",
     })
+
+
+def _fixture_checklist_rows(profile: dict, circuits: list) -> list:
+    """The Dev Tools fixture checklist, from the profile row already read for
+    the page. Irrigation is listed only when a zone circuit exists; the water
+    softener row mirrors ``has_water_softener`` and cannot be ticked here until
+    its regeneration time is set (the softener card owns that)."""
+    from ..event_rules import parse_hhmm_to_minutes
+    from ..fixtures import (CHECKLIST_FIXTURE_TYPES, FIXTURE_TYPE_LABELS,
+                            OPTIONAL_FIXTURE_TYPES, resolve_fixture_presence)
+    presence = resolve_fixture_presence(profile.get("fixture_presence"),
+                                        profile.get("has_water_softener"))
+    has_zone = any(c.get("circuit_type") == "zone" for c in circuits)
+    rows = []
+    for t in CHECKLIST_FIXTURE_TYPES:
+        if t == "irrigation_zone" and not has_zone:
+            continue
+        reason = None
+        if (t == "water_softener" and not presence[t]
+                and parse_hhmm_to_minutes(profile.get("softener_regen_start")
+                                          or "") is None):
+            reason = "set its regeneration time under Water softener first"
+        rows.append({"type": t, "label": FIXTURE_TYPE_LABELS[t],
+                     "present": presence[t],
+                     "optional": t in OPTIONAL_FIXTURE_TYPES,
+                     "disabled_reason": reason})
+    return rows
 
 
 # ── Home profile ───────────────────────────────────────────────────────────
@@ -1209,6 +1238,78 @@ async def dev_validate_detectors(circuit: str, request: Request):
         # Persists a single latest-per-circuit report; the reloaded page renders it
         # (plain form POST → redirect, like dev_retrain — kept off the JS path).
         await orch.training_manager.validate_detectors(circuit)
+    return ingress_redirect(request, "/settings#sett-dev")
+
+
+@router.post("/dev/fixture-checklist")
+async def dev_fixture_checklist(request: Request):
+    """DEV/testing only — save which fixtures this home has. A type the home
+    unticks is never named by the auto tiers and leaves the label pickers
+    until ticked again; the user's own labels are never touched.
+
+    An unticked box does not submit, so the form also sends ``listed`` for
+    every row it showed. When an answer changed, one job per circuit is
+    created HERE (so the reloaded page's first poll sees it running and the
+    outcome toasts) and the work runs in the background: the stamp already
+    differs, so a full pass re-derives every unlabelled event, then the cluster
+    suggestions are redone the way the Water Use recompute does it. Gated
+    behind ``dev_tools``."""
+    if not DEV_TOOLS:
+        return dev_tools_disabled()
+    from ..database import (recompute_all_user_label_suggestions,
+                            resuggest_all_clusters, run_isolated_write,
+                            set_fixture_presence)
+    from ..reclassify import reclassify_all_events_from_signatures
+    from ..task_registry import spawn
+    from ..config import DB_PATH
+    orch = _orch(request)
+    form = await request.form()
+    listed = form.getlist("listed")
+    present = form.getlist("present")
+    res = await run_db(set_fixture_presence, orch.db, listed, present)
+    if res.get("note"):
+        log.info("fixture checklist: %s", res["note"])
+    if not res.get("changed"):
+        return ingress_redirect(request, "/settings#sett-dev")
+    log.info("fixture checklist changed (%s) — re-deriving verdicts",
+             ", ".join(sorted(res["changed"])))
+    circuits = [c.circuit for c in orch._cfg.circuits]
+    jobs = {}
+    for c in circuits:
+        jobs[c] = await run_db(start_job, orch.db, "fixture_checklist", c,
+                               "Applying the fixture checklist…")
+
+    settled: set = set()
+    _late = ("could not re-check past events now — the hourly pass will "
+             "finish applying the checklist")
+
+    def _work(conn):
+        for c in circuits:
+            try:
+                r = reclassify_all_events_from_signatures(conn, c)
+                resuggest_all_clusters(conn, c)
+                recompute_all_user_label_suggestions(conn, c)
+                finish_job(conn, jobs[c], "done",
+                           f"{c}: fixture checklist applied — "
+                           f"{r.get('events_changed', 0)} verdict(s) changed")
+            except Exception:                                   # noqa: BLE001
+                log.exception("[%s] fixture checklist apply failed", c)
+                finish_job(conn, jobs[c], "error", f"{c}: {_late}")
+            settled.add(c)
+
+    async def _run():
+        try:
+            await run_isolated_write(DB_PATH, _work)
+        except Exception as e:                                  # noqa: BLE001
+            # The private connection itself failed (typically "database is
+            # locked" under a boot pass): no job may be left running forever.
+            log.warning("fixture checklist apply failed: %s", e)
+            for c in circuits:
+                if c not in settled:
+                    await run_db(finish_job, orch.db, jobs[c], "error",
+                                 f"{c}: {_late}")
+
+    spawn(_run(), name="fixture_checklist")
     return ingress_redirect(request, "/settings#sett-dev")
 
 

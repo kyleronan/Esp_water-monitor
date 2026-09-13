@@ -36,8 +36,8 @@ _BASELINE_VERSION: int = 20260801
 # reorder a shipped number: 20260819 shipped in September under August's prefix
 # and STAYS that way — renumbering it would make the live databases it stamped
 # fail the _UPGRADEABLE_VERSIONS check below and be told to delete themselves.
-# THE NEXT MIGRATION IS 20260905.
-_CURRENT_VERSION: int = 20260904
+# THE NEXT MIGRATION IS 20260906.
+_CURRENT_VERSION: int = 20260905
 
 # Roles removed when the firmware switched waveform delivery from 5 chunked
 # text sensors to a single HA event (firmware 3.8.0). Old DBs may still carry
@@ -398,6 +398,7 @@ _REQUIRED_COLUMNS: tuple = (
     ('fixtures'           , 'cluster_backfill_needed'        , 'cluster_backfill_needed'),
     ('home_profile'       , 'auto_split_enabled'             ),
     ('home_profile'       , 'epa_flush_cap_enabled'          ),
+    ('home_profile'       , 'fixture_presence'               ),
     ('home_profile'       , 'has_water_softener'             ),
     ('home_profile'       , 'hide_cross_talk_events'         ),
     ('home_profile'       , 'pump_alert_armed_at'            ),
@@ -1867,6 +1868,20 @@ def _apply_tail_ceiling_and_novelty(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _apply_fixture_presence_column(conn: sqlite3.Connection) -> None:
+    """Forward migration to 20260905 — the fixture checklist's answers.
+
+    ``home_profile.fixture_presence`` holds which fixtures this home has (see
+    the column comment in schema.sql). NULL keeps every default, so nothing a
+    home classified before this changes on upgrade; the column is a verdict
+    input, so the first pass after boot re-derives against it like any other
+    stamp change. Additive and idempotent."""
+    _add_columns(conn, "home_profile", (("fixture_presence", "TEXT"),),
+                 if_table_exists=True)
+    conn.commit()
+    log.info("Migration 20260905: fixture checklist column ready")
+
+
 # Ordered forward-migration chain, (introduced_in_version, apply_fn): a DB
 # stamped at V already HAS every step with introduced <= V and needs exactly
 # the steps with introduced > V, in this order. Every apply fn is idempotent,
@@ -1896,6 +1911,7 @@ _MIGRATIONS: tuple = (
     (20260902, _apply_dead_schema_and_event_indexes),
     (20260903, _apply_per_type_anomaly_rescore),
     (20260904, _apply_tail_ceiling_and_novelty),
+    (20260905, _apply_fixture_presence_column),
 )
 
 # Versions a DB may legitimately be stamped with and still be upgradeable.

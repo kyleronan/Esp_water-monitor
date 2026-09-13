@@ -16,6 +16,7 @@ from ..database import (
     clear_auto_labels,
     clear_event_classification,
     count_not_real_events,
+    get_absent_fixture_types,
     get_daily_summaries,
     get_home_profile,
     get_leak_test_history,
@@ -815,8 +816,13 @@ async def _history_page(request: Request):
         filter_bar_raw,
     )
 
+    # Every selectable type, flagged by the fixture checklist: a type the home
+    # says it lacks is rendered but not pickable (disabled + hidden), so a
+    # label already stored as one still shows in the modal's select.
+    absent = await run_db(get_absent_fixture_types, orch.db)
     fixture_type_options = [
-        {"value": k, "label": FIXTURE_TYPE_LABELS.get(k, k.replace("_", " ").title())}
+        {"value": k, "label": FIXTURE_TYPE_LABELS.get(k, k.replace("_", " ").title()),
+         "present": k not in absent}
         for k in user_selectable_types()
     ]
 

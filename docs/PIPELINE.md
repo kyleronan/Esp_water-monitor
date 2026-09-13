@@ -481,6 +481,18 @@ of: volume < 2.8 L (`TOILET_MIN_FLUSH_L`, below the smallest flush ever made); v
 30.5 L, each ×1.15); peak < 3.0 L/min (`TOILET_VETO_MIN_PK_LPM`); or > 2 active flow segments (a cistern
 refill is one continuous segment). These are structural constants, never per-home calibrated.
 
+**Fixture checklist (dev59) — post-filter on *every* verdict.** Settings → Dev Tools lists the
+fixtures the home has (`home_profile.fixture_presence`, resolved by `fixtures.resolve_fixture_presence`;
+the softener row mirrors `has_water_softener`). A type the home unticks is withheld after the toilet
+veto in both ladders (`reclassify._reclassify_chunk_sync`, `_cluster_event_sync`) — an abstention,
+never re-guessed, which is what History shows as *Other* — its cycle detector is not run, its cluster
+suggestions are nulled, and it leaves the label pickers (rendered `disabled hidden`, so a label already
+stored as one still round-trips). The column is a stamp input, so a save re-derives every unlabelled
+event; the Save button runs that full pass at once (job kind `fixture_checklist`). Human labels are
+never touched, which is what makes ticking the box again restore the verdicts. Three opt-in types
+(`ice_maker`, `humidifier`, `hose_bib`, `OPTIONAL_FIXTURE_TYPES`) are off by default and named only by
+the label-driven tiers — no rule or detector knows them.
+
 **Flush shape floor (dev45)** — `is_flush_shaped()` additionally requires a peak of
 ≥7.5 L/min (`_FLUSH_MIN_PK_LPM`). Validated on the reviewed sets: recall 89/90 on
 genuine flushes, precision 0.81 → 0.87. Its purpose is the reverse of the veto
@@ -961,7 +973,7 @@ What the stamp covers, derived by walking every read in
 |---|---|
 | build fingerprint (version + module sizes) | any code change can move any verdict; the container has no `.git`, so the version string alone is constant across a dev cycle's rebuilds |
 | `rule_calibration.params`, all regimes | bands are per-era and an event is judged by its own era's |
-| `home_profile`: softener config, `fingerprint_labeling_enabled`, `build_year` / `epa_flush_cap_enabled`, `daily_summary_tz` | the tiers and vetoes these switch on |
+| `home_profile`: softener config, `fingerprint_labeling_enabled`, `build_year` / `epa_flush_cap_enabled`, `daily_summary_tz`, `fixture_presence` (the fixture checklist) | the tiers and vetoes these switch on |
 | `circuit_profile`: `circuit_type`, `winterized` | picks the rule set; suspends the circuit |
 | `supply_regime` spans (`id`, `started_at`, `ended_at`) | closing or moving a regime re-points events at a different band set even when no band changed |
 

@@ -1289,6 +1289,50 @@
         option is enabled. Recalibration (per circuit, above) remains the normal
         long-term mechanism.
       </p>
+      {#- Fixture checklist. An unticked box does not submit, so every row the
+          form shows also sends a hidden `listed` — the server tells "unticked"
+          from "not shown" by that. The softener row mirrors has_water_softener
+          and is locked here until its regeneration time exists. #}
+      <div class="sett-card" id="sett-fixture-checklist">
+        <h3 class="sett-card-title">Fixtures in this home</h3>
+        <p style="margin:.25rem 0 .75rem">
+          Untick a fixture this home does not have and the add-on stops naming
+          it: events it would have called that read as <em>Other</em>, and it
+          leaves the label lists, until you tick it again. Your own labels are
+          never changed. The <em>optional</em> ones are off to begin with — tick
+          one to label it yourself; nothing names it automatically, and the
+          learned matching picks it up from your labels. Saving re-checks past
+          events in the background.
+        </p>
+        <form method="post" action="{{ ingress_path }}/settings/dev/fixture-checklist">
+          <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+          {% for f in fixture_checklist %}
+          <div class="sett-toggle-row">
+            <div>
+              <span class="sett-toggle-label">{{ f.label }}</span>
+              {% if f.optional %}
+              <span class="sett-toggle-desc">optional — named only from your labels</span>
+              {% endif %}
+              {% if f.disabled_reason %}
+              <span class="sett-toggle-desc">Off —
+                <a href="#water-softener" onclick="settNav('water-softener');return false">{{ f.disabled_reason }}</a></span>
+              {% elif f.type == 'water_softener' %}
+              <span class="sett-toggle-desc">same switch as the Water softener card</span>
+              {% endif %}
+            </div>
+            <label class="toggle"{% if f.disabled_reason %} style="opacity:.5"{% endif %}>
+              {% if not f.disabled_reason %}<input type="hidden" name="listed" value="{{ f.type }}">{% endif %}
+              <input type="checkbox" name="present" value="{{ f.type }}"
+                     {% if f.present %}checked{% endif %}
+                     {% if f.disabled_reason %}disabled{% endif %}>
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+          {% endfor %}
+          <button type="submit" class="btn btn-primary btn-sm" style="margin-top:.75rem">Save</button>
+        </form>
+      </div>
+
       <div class="sett-card">
         <h3 class="sett-card-title">Re-train rule calibration</h3>
         <p style="margin:.25rem 0 .75rem">
@@ -1906,6 +1950,9 @@ function settSubNav(circIdx, tab) {
 
 // ── Sidebar navigation ─────────────────────────────────────────────────────
 function settNav(id) {
+  // The dev buttons redirect to "#sett-dev" (the section's own id); a bare
+  // section name is what the sidebar passes. Accept both.
+  if (id.startsWith('sett-')) id = id.slice(5);
   document.querySelectorAll('.sett-section').forEach(el => el.style.display = 'none');
   document.querySelectorAll('.sett-nav-btn').forEach(el => el.classList.remove('active'));
   const section = document.getElementById('sett-' + id);

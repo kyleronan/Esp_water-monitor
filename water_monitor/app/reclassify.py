@@ -33,7 +33,7 @@ log = _db.log
 # Bump when the STAMP'S OWN definition changes (a new input folded in, a
 # component computed differently). Every stamp then differs from every stored
 # one and the next pass re-derives everything.
-_VERDICT_STAMP_ALGO = 3
+_VERDICT_STAMP_ALGO = 4
 
 # Force a full unstamped pass if the last one is older than this. The stamp can
 # only be as complete as the input list baked into it; this is what stops an
@@ -86,12 +86,13 @@ def compute_verdict_stamp(conn: sqlite3.Connection, circuit: str) -> str:
     # re-stamp the whole table several times a day. The softener columns feed
     # the session detector, fingerprint_labeling_enabled gates the fingerprint
     # tier, build_year / epa_flush_cap_enabled feed the toilet flush cap veto,
-    # and daily_summary_tz the time-of-day rule predicates.
+    # daily_summary_tz the time-of-day rule predicates, and fixture_presence
+    # (the fixture checklist) withholds verdicts of a type the home lacks.
     try:
         row = conn.execute(
             "SELECT has_water_softener, softener_circuit, "
             "       fingerprint_labeling_enabled, build_year, "
-            "       epa_flush_cap_enabled, daily_summary_tz "
+            "       epa_flush_cap_enabled, daily_summary_tz, fixture_presence "
             "FROM home_profile WHERE id = 1").fetchone()
         h.update(f"|home:{tuple(row) if row else ()}".encode())
     except sqlite3.OperationalError:
@@ -265,6 +266,9 @@ def _new_reclassify_counters() -> Dict[str, Any]:
     return {"scanned": 0, "matched": 0, "rule_matched": 0,
             "softener_matched": 0, "cleared": 0, "abstained": 0,
             "changed": 0, "veto_counts": {},
+            # Verdicts withheld because the fixture checklist says the home
+            # lacks that fixture, by type.
+            "absent_withheld": {},
             # Per-tier buckets: anything that was not softener or plain k-NN
             # used to be logged as "via rules", hiding TinyModel, fingerprint
             # and k-NN-invariant hits in the one line that says which tier did
@@ -398,14 +402,19 @@ def _reclassify_prepare(conn: sqlite3.Connection, circuit: str, ha_tz=None,
         _s = _db._parse_event_ts(since_ts)
         if _s is not None:
             detector_since = (_s - timedelta(hours=4)).isoformat()
+    # The fixture checklist: types the home says it lacks. The cycle detectors
+    # for those are not run (nor is the softener's, below, through the flag
+    # it mirrors), and the row loop withholds any verdict of one.
+    prof = _db.get_home_profile(conn)
+    absent = _db.absent_types_from_profile(prof)
     # One O(n) pass for the whole circuit — the per-row loop then does dict
     # lookups, never per-event window queries.
     washer_ids = (detect_washer_cycles(conn, circuit, since_ts=detector_since,
                                        calib=calib)
-                  if circuit_type != "zone" else {})
+                  if circuit_type != "zone" and "washing_machine" not in absent
+                  else {})
     # Water-softener sessions (hard-gated: enabled AND this circuit).
     softener_ids: Dict[str, Any] = {}
-    prof = _db.get_home_profile(conn)
     if (prof is not None and prof["has_water_softener"]
             and (prof["softener_circuit"] or "main") == circuit):
         band = parse_hhmm_to_minutes(prof["softener_regen_start"])
@@ -420,7 +429,7 @@ def _reclassify_prepare(conn: sqlite3.Connection, circuit: str, ha_tz=None,
     dishwasher_ids = (
         detect_dishwasher_cycles(conn, circuit, since_ts=detector_since, calib=calib,
                                  exclude_ids=set(washer_ids) | set(softener_ids))
-        if circuit_type != "zone" else {})
+        if circuit_type != "zone" and "dishwasher" not in absent else {})
     # Re-score each scanned event against the FROZEN baseline (storage only;
     # reclassify NEVER notifies or shuts off). Sensitivity is loaded once for
     # the pass (the baseline per chunk, see _reclassify_chunk_sync); the extra
@@ -550,6 +559,7 @@ def _reclassify_prepare(conn: sqlite3.Connection, circuit: str, ha_tz=None,
         "softener_ids":       softener_ids,
         "washer_ids":         washer_ids,
         "dishwasher_ids":     dishwasher_ids,
+        "absent_types":       absent,
         "qfeats":             qfeats,
         "circuit_type":       circuit_type,
         "calib":              calib,
@@ -610,6 +620,8 @@ def _reclassify_chunk_sync(conn: sqlite3.Connection, circuit: str, rows: list,
     _judged_from   = ctx["judged_from"]
     _stamp         = ctx["verdict_stamp"]
     _stamp_before  = ctx["stamp_before_ts"]
+    _absent        = ctx.get("absent_types", frozenset())
+    absent_withheld  = counters.setdefault("absent_withheld", {})
 
     scanned          = counters["scanned"]
     matched          = counters["matched"]
@@ -760,6 +772,15 @@ def _reclassify_chunk_sync(conn: sqlite3.Connection, circuit: str, rows: list,
                     veto_counts[why.split(" (")[0]] = (
                         veto_counts.get(why.split(" (")[0], 0) + 1)
                     new_type, new_via = None, None
+        # Fixture checklist: a type the home says it lacks is never named,
+        # whatever tier proposed it — the verdict is withheld (an abstain,
+        # which reads as Other), never re-guessed, until the box is ticked
+        # again. Loop level, so a cycle verdict is covered too.
+        if new_type is not None and new_type in _absent:
+            log.debug("[%s] event %s: %s (%s) withheld — not in this home's "
+                      "fixture checklist", circuit, r["id"], new_type, new_via)
+            absent_withheld[new_type] = absent_withheld.get(new_type, 0) + 1
+            new_type, new_via, new_group = None, None, None
         prev = r["matched_fixture_type"]
         _prev_conf = r["match_confidence"] if "match_confidence" in r.keys() else None
         _conf = new_conf if new_via == "tinymodel" else None
@@ -860,6 +881,7 @@ def _reclassify_finalize(conn: sqlite3.Connection, circuit: str,
     abstained        = counters["abstained"]
     changed          = counters["changed"]
     veto_counts      = counters["veto_counts"]
+    absent_withheld  = counters.get("absent_withheld") or {}
     # ── Composite annotation ─────────────────────────────────────────────────
     # Annotate sustained events with fixtures hidden inside them (a toilet
     # flushed mid-shower), then upgrade events that abstained but clearly
@@ -904,6 +926,9 @@ def _reclassify_finalize(conn: sqlite3.Connection, circuit: str,
         "events_backlog_remaining": ctx.get("backlog_remaining") or 0,
         "events_embedded_annotated": embedded_annotated,
         "events_composite_other": embedded_other,
+        # Verdicts withheld by the fixture checklist (a type the home lacks).
+        "events_absent_withheld": sum(absent_withheld.values()),
+        "absent_withheld_by_type": dict(absent_withheld),
     }
     log.info(
         "[%s] reclassify: trained %d signature(s); scanned %d unlabelled "
@@ -946,6 +971,13 @@ def _reclassify_finalize(conn: sqlite3.Connection, circuit: str,
                  circuit, "; ".join(f"{n}× {why}" for why, n
                                     in sorted(veto_counts.items(),
                                               key=lambda kv: -kv[1])))
+    if absent_withheld:
+        log.info("[%s] fixture checklist: %d verdict(s) withheld — %s (not in "
+                 "this home; they read as Other)", circuit,
+                 sum(absent_withheld.values()),
+                 "; ".join(f"{n}× {t}" for t, n
+                           in sorted(absent_withheld.items(),
+                                     key=lambda kv: -kv[1])))
     return result
 
 

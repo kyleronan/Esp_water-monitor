@@ -186,6 +186,13 @@ CREATE TABLE IF NOT EXISTS home_profile (
     -- orchestrator compares this to the detected zone after tz detection and
     -- rebuilds when they differ, which also covers the user moving HA's zone.
     daily_summary_tz               TEXT,
+    -- fixture_presence (migration 20260905): the fixture checklist (Settings →
+    -- Dev Tools). A JSON object of the answers given — {"dishwasher": false,
+    -- "ice_maker": true} — over fixtures.resolve_fixture_presence's defaults
+    -- (core types on, opt-in types off); NULL = every default. A type the home
+    -- says it lacks is never named by the auto tiers and leaves the label
+    -- pickers. water_softener is NOT kept here: it follows has_water_softener.
+    fixture_presence               TEXT,
     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );

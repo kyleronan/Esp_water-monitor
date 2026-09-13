@@ -189,8 +189,10 @@
         <select id="hf-fixture" name="fixture">
           <option value="">Any</option>
           {% for o in fixture_type_options %}
+          {#- A fixture the checklist says the home lacks stays out of the list
+              (disabled + hidden) unless it is the filter already in force. #}
           <option value="{{ o.value }}"
-                  {% if filter_bar.fixture == o.value %}selected{% endif %}>{{ o.label }}</option>
+                  {% if filter_bar.fixture == o.value %}selected{% elif not o.present %}disabled hidden{% endif %}>{{ o.label }}</option>
           {% endfor %}
           <option value="unlabelled"
                   {% if filter_bar.fixture == 'unlabelled' %}selected{% endif %}>Unlabelled</option>
@@ -907,8 +909,11 @@
       <label class="evt-modal-label" for="emd-fixture-select">Assign fixture type</label>
       <select id="emd-fixture-select" class="evt-modal-select">
         <option value="">— no assignment —</option>
+        {#- A fixture the checklist says the home lacks is not offered, but the
+            option stays in the DOM (disabled + hidden) so a label already
+            stored as one still shows here — and round-trips unchanged. #}
         {% for ft in fixture_type_options %}
-        <option value="{{ ft.value }}">{{ ft.label }}</option>
+        <option value="{{ ft.value }}"{% if not ft.present %} disabled hidden{% endif %}>{{ ft.label }}</option>
         {% endfor %}
       </select>
     </div>

@@ -715,6 +715,97 @@ def update_home_profile(conn: sqlite3.Connection, **kwargs) -> None:
     conn.commit()
 
 
+# ── Fixture checklist (home_profile.fixture_presence) ─────────────────────
+# Which fixtures the home has. The auto tiers withhold a verdict of a type the
+# home says it lacks, and the pickers hide it, until it is ticked again; the
+# stored answers live in one JSON column and water_softener follows
+# has_water_softener (see fixtures.resolve_fixture_presence).
+
+def fixture_presence_from_profile(prof) -> Dict[str, bool]:
+    """type → present from a home_profile row (or None: every default). The
+    column guard keeps a pre-migration row or a test's bare row readable."""
+    from .fixtures import resolve_fixture_presence
+    if prof is None:
+        return resolve_fixture_presence(None, False)
+    keys = prof.keys() if hasattr(prof, "keys") else ()
+    stored = prof["fixture_presence"] if "fixture_presence" in keys else None
+    softener = prof["has_water_softener"] if "has_water_softener" in keys else False
+    return resolve_fixture_presence(stored, softener)
+
+
+def absent_types_from_profile(prof) -> frozenset:
+    """The checklist types a home_profile row says the home lacks."""
+    from .fixtures import absent_fixture_types
+    return absent_fixture_types(fixture_presence_from_profile(prof))
+
+
+def get_fixture_presence(conn: sqlite3.Connection) -> Dict[str, bool]:
+    return fixture_presence_from_profile(get_home_profile(conn))
+
+
+def get_absent_fixture_types(conn: sqlite3.Connection) -> frozenset:
+    """The types the auto tiers must not name. One single-row read; every
+    gate site calls this rather than caching it, so a save takes effect on
+    the next event with no restart (the softener toggle's rule)."""
+    return absent_types_from_profile(get_home_profile(conn))
+
+
+def set_fixture_presence(conn: sqlite3.Connection, listed, present, *,
+                         mirror_softener: bool = True) -> Dict[str, Any]:
+    """Store the checklist's answers for the types the form ``listed`` (an
+    unticked box does not submit, so the caller says which rows it showed);
+    ``present`` are the ticked ones. Answers for types not listed are kept.
+
+    ``water_softener`` is mirrored onto ``has_water_softener`` instead of
+    stored: unticking turns the softener off (its regeneration time is kept,
+    so ticking it back restores the session detector); ticking it needs a
+    stored regeneration time, otherwise the answer is refused with a ``note``
+    — the softener card is where that time is set.
+
+    Returns ``{"changed": set of types whose presence flipped, "presence":
+    the resolved map afterwards, "note": str | None}``. Commits.
+    """
+    from .fixtures import CHECKLIST_FIXTURE_TYPES
+    prof = get_home_profile(conn)
+    before = fixture_presence_from_profile(prof)
+    listed = [t for t in listed if t in CHECKLIST_FIXTURE_TYPES]
+    present = set(present)
+    answers: Dict[str, bool] = {}
+    stored = (prof["fixture_presence"] if prof is not None
+              and "fixture_presence" in prof.keys() else None)
+    if stored:
+        try:
+            parsed = json.loads(stored)
+            if isinstance(parsed, dict):
+                answers = {k: bool(v) for k, v in parsed.items()
+                           if k in CHECKLIST_FIXTURE_TYPES and k != "water_softener"
+                           and (isinstance(v, bool) or v in (0, 1))}
+        except (ValueError, TypeError):
+            answers = {}
+    for t in listed:
+        if t != "water_softener":
+            answers[t] = t in present
+    updates: Dict[str, Any] = {"fixture_presence": json.dumps(answers, sort_keys=True)}
+    note = None
+    if mirror_softener and "water_softener" in listed:
+        want = "water_softener" in present
+        have = bool(prof["has_water_softener"]) if prof is not None else False
+        if want and not have:
+            from .event_rules import parse_hhmm_to_minutes
+            regen = prof["softener_regen_start"] if prof is not None else None
+            if parse_hhmm_to_minutes(regen or "") is None:
+                note = ("Water softener not switched on — set its regeneration "
+                        "time under Water softener first")
+            else:
+                updates["has_water_softener"] = 1
+        elif have and not want:
+            updates["has_water_softener"] = 0
+    update_home_profile(conn, **updates)
+    after = get_fixture_presence(conn)
+    return {"changed": {t for t in after if after[t] != before.get(t)},
+            "presence": after, "note": note}
+
+
 def get_training_state(conn: sqlite3.Connection, circuit: str) -> Optional[sqlite3.Row]:
     return _get_by_circuit(conn, "training_state", circuit)
 
@@ -4239,6 +4330,7 @@ def recompute_cluster_suggestion_from_user_labels(
     circuit: str,
     cluster_id: int,
     global_counts: Optional[Dict[str, int]] = None,
+    absent_types: Optional[frozenset] = None,
 ) -> Optional[Dict[str, Any]]:
     """Recompute a cluster's suggested_type from a majority vote of user labels
     on its member events.
@@ -4248,7 +4340,12 @@ def recompute_cluster_suggestion_from_user_labels(
     (or reset), or ``None`` when there are no labels yet AND no prior
     user-labels suggestion is in place (the cluster row is untouched and any
     heuristic suggestion stays valid).
+
+    ``absent_types`` (the fixture checklist; read here when not passed in) is
+    treated like an 'other' winner: a type the home says it lacks abstains.
     """
+    if absent_types is None:
+        absent_types = get_absent_fixture_types(conn)
     # One row per labelled non-excluded member; MIN(capture_id) dedups the
     # training_capture_candidates fan-out so each event is counted exactly once.
     detail = conn.execute(
@@ -4320,6 +4417,7 @@ def recompute_cluster_suggestion_from_user_labels(
     # Suggest the winner only if it clears all three gates; else ABSTAIN with a
     # NULL type but source 'user_labels' (so the heuristic pass won't repopulate).
     suggest = (winner_type != "other"
+               and winner_type not in absent_types
                and total_raw >= _SUGGEST_MIN_MEMBERS
                and share >= _SUGGEST_MIN_SHARE
                and winner_raw >= _SUGGEST_MIN_WINNER_RAW)
@@ -4356,6 +4454,7 @@ def recompute_all_user_label_suggestions(
     skips 'user_labels' clusters). Returns ``{clusters, suggested, abstained,
     cleared}`` (cleared = a prior non-NULL suggestion now abstained)."""
     global_counts = _knn_usable_label_counts(conn, circuit)
+    absent = get_absent_fixture_types(conn)
     cluster_ids = [r[0] for r in conn.execute(
         "SELECT fc.id FROM fixture_clusters fc "
         "WHERE fc.circuit = ? AND ("
@@ -4371,7 +4470,8 @@ def recompute_all_user_label_suggestions(
             (circuit, cid)).fetchone()
         prev_type = prev["suggested_type"] if prev else None
         res = recompute_cluster_suggestion_from_user_labels(
-            conn, circuit, int(cid), global_counts=global_counts)
+            conn, circuit, int(cid), global_counts=global_counts,
+            absent_types=absent)
         new_type = res.get("suggested_type") if res else None
         if new_type:
             suggested += 1
@@ -5751,6 +5851,7 @@ def resuggest_all_clusters(conn: sqlite3.Connection, circuit: str) -> Dict[str, 
     overwritten. Returns ``{"clusters", "updated"}``."""
     from .fixtures import suggest_fixture_type
     ctype = get_circuit_type(conn, circuit)
+    absent = get_absent_fixture_types(conn)
     rows = conn.execute(
         "SELECT id, centroid, suggested_type, suggestion_source "
         "FROM fixture_clusters WHERE circuit = ?", (circuit,)
@@ -5764,6 +5865,8 @@ def resuggest_all_clusters(conn: sqlite3.Connection, circuit: str) -> Dict[str, 
         except (json.JSONDecodeError, TypeError):
             continue
         new_type, new_conf = suggest_fixture_type(centroid, ctype)
+        if new_type in absent:            # a fixture this home says it lacks
+            new_type, new_conf = None, 0.0
         if new_type != r["suggested_type"]:
             conn.execute(
                 "UPDATE fixture_clusters SET suggested_type = ?, "

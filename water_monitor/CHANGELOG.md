@@ -5,11 +5,19 @@
 Fixture labeling that survives a change in water supply, full booster-pump
 support, and a long run of accuracy work driven by audits of the add-on's
 stored events against raw Home Assistant history. (Shipped incrementally as
-dev1–dev58 — dev7/dev8 landed without a version bump; per-build detail is in
+dev1–dev59 — dev7/dev8 landed without a version bump; per-build detail is in
 git history.)
 
 ### New Features
 
+- **Tell it which fixtures you have** — a checklist under Settings → Dev Tools.
+  Untick a fixture your home does not have and the add-on stops naming it:
+  events it would have called that read as *Other*, and it leaves the label
+  lists, until you tick it again; your own labels are never changed, so
+  ticking it back restores what it knew. Three fixtures the old sensor could
+  not tell apart are back as optional entries — ice maker / fridge water,
+  humidifier, garden hose — off to begin with; tick one and you can label it
+  yourself, and the learned matching picks it up from your labels.
 - **It can tell a washing machine filling from a toilet flushing** — a washer
   fills in stages, and the middle stage moves about as much water, about as
   fast, as a flush. Judged on its own it is a flush; judged alongside the draws

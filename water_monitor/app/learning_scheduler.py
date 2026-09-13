@@ -21,7 +21,8 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from .config import DATA_DIR
-from .database import finish_job, get_write_lock, run_db, start_job
+from .database import (finish_job, get_absent_fixture_types, get_write_lock,
+                       run_db, start_job)
 
 log = logging.getLogger(__name__)
 
@@ -67,12 +68,17 @@ class LearningScheduler:
                 await asyncio.sleep(_ON_ERROR_S)
 
     async def _health_pass(self) -> None:
-        from .health_job import run_nightly
+        from .health_job import DEFAULT_WATCHED, run_nightly
+        # A fixture the checklist says the home lacks is not watched — it
+        # would read as "under-covered" every night for a reason nobody can fix.
+        absent = await run_db(get_absent_fixture_types, self._db)
+        watched = [t for t in DEFAULT_WATCHED if t not in absent]
         for circ in self._cfg.circuits:
             if self._stop.is_set():
                 return
             async with get_write_lock():
-                out = await run_db(run_nightly, self._db, circ.circuit)
+                out = await run_db(run_nightly, self._db, circ.circuit,
+                                   watched=watched)
             fired = {k: v["alarms"] for k, v in (out or {}).items() if v["alarms"]}
             if fired:
                 log.warning("[%s] fixture health raised: %s", circ.circuit,

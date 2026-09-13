@@ -36,6 +36,11 @@ FIXTURE_TYPES: List[str] = [
     "washing_machine",
     "dishwasher",
     "water_softener",
+    # Opt-in (OPTIONAL_FIXTURE_TYPES, below): off until the home switches them
+    # on in the fixture checklist, and named only from the home's own labels.
+    "ice_maker",
+    "humidifier",
+    "hose_bib",
     # Zone-circuit only
     "irrigation_zone",
     # Catch-all / internal
@@ -43,9 +48,12 @@ FIXTURE_TYPES: List[str] = [
     "leak_test",
 ]
 
-# Mapping from the old 23-entry taxonomy to the new 8-entry taxonomy.
-# Used by db_migrations to rewrite stored type strings, and importable
-# by tests as a regression guard.
+# Mapping from the old 23-entry taxonomy to the current one. Applied by
+# database._canonical_fixture_type at every read/write that must agree on a
+# slug, and importable by tests as a regression guard. The three opt-in types
+# map to themselves again (they were folded into 'other' while the turbine
+# sensor could not tell them apart); the fridge's other draws and the outdoor
+# tap fold into the opt-in type they physically are.
 LEGACY_TYPE_REMAP: Dict[str, str] = {
     # Unchanged
     "toilet":                "toilet",
@@ -61,19 +69,20 @@ LEGACY_TYPE_REMAP: Dict[str, str] = {
     "bathroom_tap":          "tap",
     "kitchen_tap":           "tap",
     "utility_tap":           "tap",
-    # Folded into other
-    "ice_maker":             "other",
-    "refrigerator_water":    "other",
-    "ro_drinking_faucet":    "other",
-    "humidifier":            "other",
+    # Opt-in types (and their aliases)
+    "ice_maker":             "ice_maker",
+    "refrigerator_water":    "ice_maker",
+    "humidifier":            "humidifier",
+    "hose_bib":              "hose_bib",
+    "outdoor_tap":           "hose_bib",
     # water_softener is a first-class type — preserve it through
     # _canonical_fixture_type so user labels + session matches store correctly.
     "water_softener":        "water_softener",
+    # Folded into other
+    "ro_drinking_faucet":    "other",
     "ro_system_whole_house": "other",
     "evaporative_cooler":    "other",
     "boiler_makeup":         "other",
-    "hose_bib":              "other",
-    "outdoor_tap":           "other",
     "pool_fill":             "other",
 }
 
@@ -85,6 +94,9 @@ FIXTURE_TYPE_LABELS: Dict[str, str] = {
     "washing_machine":  "Washing Machine",
     "dishwasher":       "Dishwasher",
     "water_softener":   "Water Softener",
+    "ice_maker":        "Ice Maker / Fridge Water",
+    "humidifier":       "Humidifier",
+    "hose_bib":         "Garden Hose / Hose Bib",
     "irrigation_zone":  "Irrigation Zone",
     "other":            "Other",
     "leak_test":        "Leak Test (auto)",
@@ -98,6 +110,54 @@ INTERNAL_FIXTURE_TYPES: List[str] = ["leak_test"]
 def user_selectable_types() -> List[str]:
     """Fixture types the user can pick from in the UI."""
     return [t for t in FIXTURE_TYPES if t not in INTERNAL_FIXTURE_TYPES]
+
+
+# ── Fixture checklist (which fixtures this home has) ──────────────────────
+# Settings → Dev Tools lists these; a type the home unticks is never named by
+# the auto tiers (the verdict is withheld, which reads as Other) and leaves the
+# label pickers until ticked again. 'other' is the catch-all and 'leak_test'
+# internal, so neither can be switched off.
+CHECKLIST_FIXTURE_TYPES: List[str] = [
+    t for t in FIXTURE_TYPES if t not in ("other", "leak_test")]
+
+# Off until the home switches them on. No rule or cycle detector names these —
+# only the label-driven tiers (fingerprint, k-NN, learned model) can, from the
+# labels the home gives — so a home that never ticks one never sees it.
+OPTIONAL_FIXTURE_TYPES: frozenset = frozenset({"ice_maker", "humidifier", "hose_bib"})
+
+
+def resolve_fixture_presence(stored: Optional[str],
+                             has_water_softener) -> Dict[str, bool]:
+    """type → present, for every CHECKLIST type.
+
+    ``stored`` is ``home_profile.fixture_presence``: a JSON object of the
+    answers actually given (``{"dishwasher": false, "ice_maker": true}``); a
+    missing answer is the default — core types on, OPTIONAL_FIXTURE_TYPES off.
+    Anything unparseable, any unknown key and any non-boolean value is ignored.
+    ``water_softener`` is never read from the JSON: it follows
+    ``home_profile.has_water_softener``, the switch the softener card owns.
+    """
+    presence = {t: t not in OPTIONAL_FIXTURE_TYPES for t in CHECKLIST_FIXTURE_TYPES}
+    answers: Dict = {}
+    if stored:
+        try:
+            import json
+            parsed = json.loads(stored)
+            if isinstance(parsed, dict):
+                answers = parsed
+        except (ValueError, TypeError):
+            answers = {}
+    for t, v in answers.items():
+        if t in presence and t != "water_softener" and (
+                isinstance(v, bool) or v in (0, 1)):
+            presence[t] = bool(v)
+    presence["water_softener"] = bool(has_water_softener)
+    return presence
+
+
+def absent_fixture_types(presence: Dict[str, bool]) -> frozenset:
+    """The checklist types the home says it does not have."""
+    return frozenset(t for t, p in presence.items() if not p)
 
 
 # ── Circuit type taxonomy ─────────────────────────────────────────────────
@@ -123,10 +183,10 @@ ZONE_ONLY_ALERT_TYPES: frozenset = frozenset({
     "zone_duration_overrun",
 })
 
-# Fixture types appropriate for a zone (irrigation) circuit.
-# hose_bib and pool_fill fold into "other", so zone circuits offer only two
-# choices.
-_ZONE_FIXTURE_TYPES: List[str] = ["irrigation_zone", "other"]
+# Fixture types appropriate for a zone (irrigation) circuit. A hose off the
+# irrigation line is the one opt-in type that belongs here; pool_fill folds
+# into "other".
+_ZONE_FIXTURE_TYPES: List[str] = ["irrigation_zone", "hose_bib", "other"]
 
 
 def normalize_circuit_type(value: Optional[str]) -> str:
@@ -248,7 +308,7 @@ def normalize_fixture_type_for_circuit(
     if not s:
         return "other"
     # Apply the legacy alias map (shower→shower_tub, bathroom_tap→tap,
-    # hose_bib→other, etc.).
+    # outdoor_tap→hose_bib, pool_fill→other, etc.).
     canonical = LEGACY_TYPE_REMAP.get(s, s)
     allowed = (set(zone_user_selectable_types())
                if circuit_kind == "zone"
@@ -394,6 +454,42 @@ FIXTURE_VARIANCE_PROFILES: Dict[str, Dict] = {
         "multimodal": False,
     },
 
+    # ── Opt-in (label-driven only) ───────────────────────────────────────
+    "ice_maker": {
+        # A fixed-volume fill: the fridge's valve meters the same few hundred
+        # millilitres each time, so volume and duration are the identity.
+        "anchor_weights": {
+            "volume_litres":    2.0,
+            "duration_seconds": 2.0,
+            "avg_flow_lpm":     1.5,
+        },
+        "float_features": {"hour_sin", "hour_cos", "day_of_week", "is_weekend"},
+        "expected_cv": {"volume_litres": 0.20, "duration_seconds": 0.25},
+        "multimodal": False,
+    },
+    "humidifier": {
+        # A float-valve top-up: small, repeatable, at a rate set by the valve.
+        "anchor_weights": {
+            "volume_litres":    2.0,
+            "duration_seconds": 2.0,
+            "avg_flow_lpm":     1.5,
+        },
+        "float_features": {"hour_sin", "hour_cos", "day_of_week", "is_weekend"},
+        "expected_cv": {"volume_litres": 0.30, "duration_seconds": 0.30},
+        "multimodal": False,
+    },
+    "hose_bib": {
+        # User-driven like a tap: how long the hose runs is a choice; the rate
+        # and pressure drop of an outdoor spigot are what repeat.
+        "anchor_weights": {
+            "avg_flow_lpm":       2.5,
+            "pressure_delta_psi": 1.5,
+        },
+        "float_features": {"duration_seconds", "volume_litres", "duration_log"},
+        "expected_cv": {"duration_seconds": 0.60, "volume_litres": 0.60},
+        "multimodal": False,
+    },
+
     # ── Special ──────────────────────────────────────────────────────────
     "leak_test": {
         # Internal type used by the leak-test scheduler. Events tagged with
@@ -431,6 +527,9 @@ FIXTURE_MATCH_THRESHOLDS: Dict[str, float] = {
     "washing_machine":  4.5,
     "dishwasher":       4.5,
     "water_softener":   1.5,   # session-detected; neutral (inert for k-NN)
+    "ice_maker":        3.0,   # deterministic fills, like toilet
+    "humidifier":       3.0,
+    "hose_bib":         4.0,   # user-driven, like tap/shower
     "irrigation_zone":  3.5,
     "leak_test":        0.8,
     "other":            1.5,
@@ -585,7 +684,8 @@ def _rule_irrigation_zone(centroid: Dict, circuit_type: str) -> Optional[Tuple[s
     # Irrigation zones run ~4-60 minutes at sustained flow
     if dur >= 240 and flow >= 5:
         return ("irrigation_zone", 0.85)
-    # Short zone events fall through to 'other' (hose_bib removed from taxonomy)
+    # Short zone events fall through to 'other' (hose_bib is opt-in and named
+    # only from the home's labels, never by a rule)
     return None
 
 

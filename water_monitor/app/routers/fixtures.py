@@ -15,6 +15,7 @@ from ..database import (
     cleanup_composite_flags,
     coalesce_low_flow_events,
     find_orphaned_cluster_references,
+    get_absent_fixture_types,
     get_active_exclusion_window,
     get_all_cluster_stats,
     get_category_rollup,
@@ -145,9 +146,15 @@ def _fixtures_page_payload(orch, range_start_utc):
         "tap":             "\U0001F6B0",
         "washing_machine": "\U0001F455",
         "dishwasher":      "\U0001F37D",
+        "ice_maker":       "\U0001F9CA",
+        "humidifier":      "\U0001F4A8",
+        "hose_bib":        "\U0001F33F",
         "irrigation_zone": "\U0001F4A7",
         "other":           "❓",
     }
+    # The fixture checklist: a type the home says it lacks gets no empty card
+    # (its events, if it ever had labelled ones, still get their card).
+    absent = get_absent_fixture_types(orch.db)
 
     circuits_ctx = []
     for circ_cfg in orch._cfg.circuits:
@@ -197,7 +204,8 @@ def _fixtures_page_payload(orch, range_start_utc):
         # Lifetime-desc order; empty cards last so the user sees real usage
         # first.
         ordered = sorted(
-            categories.values(),
+            (cat for cat in categories.values()
+             if cat["type"] not in absent or cat["lifetime_event_count"]),
             key=lambda r: (r["lifetime_event_count"] == 0,
                            -r["lifetime_volume_l"], r["label"]),
         )
