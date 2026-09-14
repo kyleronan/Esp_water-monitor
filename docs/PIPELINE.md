@@ -1073,6 +1073,26 @@ back-to-back on 2026-08-15). Duplicate requests are now declined; the in-flight
 flag clears in `finally`, because a wedged button would be worse than the
 duplicates it prevents.
 
+### The shared connection can wedge itself (dev60)
+
+"database is locked" has two shapes. The ordinary one waits out the 5 s busy
+timeout on another connection's write lock. The other is instant, and it is
+self-inflicted: a write on the shared connection loses the race, the caller
+swallows the error, and Python leaves the implicit transaction **open**. The
+next save's reads pin a snapshot inside it; the background job commits again;
+from then on every write on the shared connection fails immediately with
+`SQLITE_BUSY_SNAPSHOT` — the same message, no wait — until something rolls
+back. On 2026-09-13 one lost `propagate_cycle_label` write did this during the
+hourly drain and label saves failed for four minutes (retries spaced exactly
+1/2/4 s), while the stuck-writer detector blamed a phantom other connection.
+Three layers now close it: the two swallowing paths in the label PATCH roll
+back; `run_db` rolls back any transaction a callable leaves open on the
+registered shared connection and names the leaker at WARNING (chunk =
+transaction is the contract, so an open one after a callable returns is a bug
+by definition); and the sync drain's `yield_write_lock` also commits once the
+lock has been held `_YIELD_MAX_HOLD_S` (2 s), because the 40-row cadence
+alone drifted past the busy timeout once rows slowed to ~150 ms.
+
 ---
 
 ## Measured and rejected (do not re-attempt without new evidence)

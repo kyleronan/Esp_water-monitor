@@ -20,6 +20,7 @@ while leaving those tests green.
 from __future__ import annotations
 
 import sqlite3
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
@@ -643,6 +644,7 @@ def _reclassify_chunk_sync(conn: sqlite3.Connection, circuit: str, rows: list,
     # set, so hoisting it out of the loop is one query instead of one per event.
     # MATURE because in a batch pass every sibling is already in the table.
     _burst_ctx = {}
+    _held_since = time.monotonic()
     try:
         from . import burst_features as _bf
         _burst_ctx = _bf.compute_for_events(
@@ -856,8 +858,10 @@ def _reclassify_chunk_sync(conn: sqlite3.Connection, circuit: str, rows: list,
         # write-lock; without the yield one long pass holds the SQLite write
         # lock throughout and every concurrent user save gets "database is
         # locked".
-        if yield_lock:
-            _db.yield_write_lock(conn, scanned, every=_SYNC_YIELD_EVERY_ROWS)
+        if yield_lock and _db.yield_write_lock(conn, scanned,
+                                               every=_SYNC_YIELD_EVERY_ROWS,
+                                               held_since=_held_since):
+            _held_since = time.monotonic()
     conn.commit()
     counters.update(scanned=scanned, matched=matched,
                     rule_matched=rule_matched,

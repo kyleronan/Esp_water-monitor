@@ -75,13 +75,56 @@ def is_retryable_db_error(exc: BaseException) -> bool:
     return any(sig in text for sig in _RETRYABLE_DB_FAULTS)
 
 
+# The one shared connection (the orchestrator's), registered so run_db can
+# check it after every callable. A callable that swallows a "database is
+# locked" error leaves the implicit transaction OPEN; the next callable's reads
+# then pin a snapshot inside it, another connection commits, and from there
+# every write on the shared connection fails INSTANTLY with SQLITE_BUSY_SNAPSHOT
+# ("database is locked", no busy wait) until something rolls back. Observed
+# 2026-09-13: one lost propagate write wedged label saves for four minutes and
+# the stuck-writer detector blamed a phantom other connection.
+_SHARED_CONN: Optional[sqlite3.Connection] = None
+
+
+def register_shared_connection(conn: Optional[sqlite3.Connection]) -> None:
+    global _SHARED_CONN
+    _SHARED_CONN = conn
+
+
+def _release_leaked_transaction(fn) -> None:
+    """After a run_db callable: a transaction still open on the shared
+    connection is a leak by contract (chunk = transaction; every callable
+    commits or rolls back its own writes), and left alone it wedges every
+    later write. Roll it back and name the leaker. DB thread only."""
+    conn = _SHARED_CONN
+    if conn is None:
+        return
+    try:
+        leaked = conn.in_transaction
+    except sqlite3.ProgrammingError:          # closed
+        return
+    if not leaked:
+        return
+    _rollback_quietly(conn)
+    log.warning("%s left a transaction open on the shared connection — rolled "
+                "back so later saves cannot fail on its stale snapshot",
+                getattr(fn, "__qualname__", None) or getattr(fn, "__name__", repr(fn)))
+
+
+def _run_db_guarded(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        _release_leaked_transaction(fn)
+
+
 async def run_db(fn, *args, **kwargs):
     """Run blocking DB work on the single DB thread and await the result."""
     import asyncio
     import functools
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
-        get_db_executor(), functools.partial(fn, *args, **kwargs))
+        get_db_executor(), functools.partial(_run_db_guarded, fn, *args, **kwargs))
 
 
 def get_connection(db_path: Path) -> sqlite3.Connection:
@@ -173,18 +216,33 @@ async def run_isolated_write(db_path, fn):
         return await loop.run_in_executor(None, _run)
 
 
+# The longest a yielding loop may hold the write lock between commits. The
+# row cadence alone drifted past the 5 s busy timeout when rows got slower
+# (dev58: ~150 ms/row × 40 rows ≈ 6 s), and a save that loses that race can
+# wedge the shared connection (see _release_leaked_transaction).
+_YIELD_MAX_HOLD_S: float = 2.0
+
+
 def yield_write_lock(conn: sqlite3.Connection, scanned: int,
-                     every: int = 300) -> None:
+                     every: int = 300, held_since: Optional[float] = None) -> bool:
     """Anti-starvation yield for long storage-only write loops (reclassify,
-    embedded-fixture scan): every ``every`` rows, commit — releasing the SQLite
-    file write-lock that a single end-of-loop commit would hold for the whole
-    scan — and sleep ~30 ms so a concurrently waiting writer (a user label save)
-    can win it; a bare commit re-acquires within microseconds, too fast for the
-    waiter. ONE definition so the load-bearing cadence/sleep tuning can't drift
-    between loops. Call from executor threads only (it sleeps)."""
-    if scanned % every == 0:
-        conn.commit()
-        time.sleep(0.03)
+    embedded-fixture scan): every ``every`` rows — or once the lock has been
+    held ``_YIELD_MAX_HOLD_S`` since ``held_since`` (a ``time.monotonic()``
+    stamp the caller resets when this returns True) — commit, releasing the
+    SQLite file write-lock that a single end-of-loop commit would hold for the
+    whole scan, and sleep ~30 ms so a concurrently waiting writer (a user
+    label save) can win it; a bare commit re-acquires within microseconds, too
+    fast for the waiter. ONE definition so the load-bearing cadence/sleep
+    tuning can't drift between loops. Call from executor threads only (it
+    sleeps). Returns True when it committed."""
+    due = scanned % every == 0
+    if not due and held_since is not None:
+        due = time.monotonic() - held_since >= _YIELD_MAX_HOLD_S
+    if not due:
+        return False
+    conn.commit()
+    time.sleep(0.03)
+    return True
 
 
 @contextmanager

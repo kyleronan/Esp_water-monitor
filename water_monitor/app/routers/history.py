@@ -12,6 +12,7 @@ from ..database import (
     _CYCLE_PULSE_WINDOW_SECONDS,
     _NOTE_KIND_SQL,
     _parse_event_ts,
+    _rollback_quietly,
     classify_action,
     clear_auto_labels,
     clear_event_classification,
@@ -1095,6 +1096,11 @@ def _patch_event_sync(db, event_id: str, circuit: str, payload: dict) -> dict:
         except _sqlite3.OperationalError as e:
             if "locked" not in str(e).lower():
                 raise
+            # The failed write left its transaction open. Left there, the next
+            # save's reads pin a snapshot inside it and every write after the
+            # other writer's next commit fails instantly — the wedge that held
+            # label saves for four minutes on 2026-09-13.
+            _rollback_quietly(db)
             note_locked_write("history.patch_event")
             return {"error": {
                 "error": "The database is busy with a background job — "
@@ -1222,7 +1228,10 @@ def _patch_event_sync(db, event_id: str, circuit: str, payload: dict) -> dict:
             reclassify = True
         except Exception as e:
             # Propagation is best-effort. A failure here must not block
-            # the label save the user already saw succeed.
+            # the label save the user already saw succeed — but its
+            # transaction must not outlive it either (see the locked branch
+            # above: this is exactly the write that wedged the connection).
+            _rollback_quietly(db)
             log.warning(
                 "[%s] propagate user label for event %s failed: %s",
                 circuit, event_id, e,

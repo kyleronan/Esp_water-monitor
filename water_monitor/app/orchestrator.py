@@ -38,6 +38,7 @@ from .database import (
     load_circuit_labels,
     load_operator_ids,
     rebuild_daily_summaries,
+    register_shared_connection,
     recompute_all_user_label_suggestions,
     recompute_cycle_pulse_counts,
     resuggest_all_clusters,
@@ -964,6 +965,7 @@ class Orchestrator:
         _run_t0 = time.monotonic()
         # Database
         self._db = init_db(DB_PATH)
+        register_shared_connection(self._db)
 
         # The whole pre-HA boot block — per-circuit defaults, the
         # orphan-reference integrity check and the incomplete-reseed warning —
