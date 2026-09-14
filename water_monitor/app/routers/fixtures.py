@@ -256,21 +256,22 @@ def _fixtures_page_payload(orch, range_start_utc):
                     health_ctx["learning"][cid] = st
             except Exception:                       # noqa: BLE001
                 pass
-            # Overlap groups where water is still counted twice. VISIBILITY
-            # ONLY — this surface reports the litres; it applies no volume
-            # policy of its own.
+            # Overlap groups where water is still counted twice AND the
+            # rebuild can still reach them (inside HA's history window). Older
+            # ones stay on the Dev Tools card: a banner about litres nothing
+            # can fix is a nag, not a prompt. VISIBILITY ONLY — this surface
+            # reports the litres; it applies no volume policy of its own.
             try:
                 from ..overlap_guard import summarize_overlap_groups
                 from ..reprocess import _SPLIT_LOOKBACK_H
                 _og = [g for g in summarize_overlap_groups(
                             orch.db, cid, retention_hours=_SPLIT_LOOKBACK_H)
-                       if g["state"] != "resolved"]
+                       if g["state"] != "resolved" and g["within_retention"]]
                 if _og:
                     health_ctx["overlaps"][cid] = {
                         "circuit_name": circ.get("display_name") or cid,
                         "groups": len(_og),
                         "litres": round(sum(g["excess_l"] for g in _og), 1),
-                        "within_retention": sum(1 for g in _og if g["within_retention"]),
                     }
             except Exception:                       # noqa: BLE001
                 pass
