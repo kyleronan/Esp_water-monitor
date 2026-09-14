@@ -171,6 +171,64 @@ def _row_counts(db, tables: List[str]) -> Dict[str, int]:
     return out
 
 
+# ── Sizes the Backup page shows ──────────────────────────────────────────────
+# Three different numbers, and the page used to blur them: the file ON DISK
+# keeps every page a deleted row ever freed (SQLite reuses them, it never
+# shrinks the file), an export is written compact by VACUUM INTO, and the zip
+# then compresses that. 120 MB on disk / 25 MB downloaded is normal.
+
+def _db_size_facts(db) -> Dict[str, int]:
+    """``disk`` = the live file's size; ``live`` = the pages actually holding
+    data (page_count - freelist_count) × page_size — what an export ships
+    before compression."""
+    try:
+        disk = DB_PATH.stat().st_size if DB_PATH.exists() else 0
+    except OSError:
+        disk = 0
+    try:
+        page_size = int(db.execute("PRAGMA page_size").fetchone()[0])
+        pages = int(db.execute("PRAGMA page_count").fetchone()[0])
+        free = int(db.execute("PRAGMA freelist_count").fetchone()[0])
+        live = max(0, pages - free) * page_size
+    except Exception:                                   # noqa: BLE001
+        live = disk
+    return {"disk": disk, "live": min(live, disk) if disk else live}
+
+
+# What the last Full Export actually came to. The zip ratio of a SQLite file
+# depends on what the home stores (waveform JSON compresses far better than
+# indexes), so the page estimates the next export from this home's own last
+# one and falls back to a typical ratio only until there has been one.
+_EXPORT_STATS_PATH = Path(DATA_DIR) / "export_stats.json"
+_FULL_ZIP_RATIO_DEFAULT = 0.4
+
+
+def _record_export_stats(zip_bytes: int, live_bytes: int) -> None:
+    try:
+        _EXPORT_STATS_PATH.write_text(json.dumps({
+            "full_zip_bytes": int(zip_bytes), "live_bytes": int(live_bytes),
+            "at": datetime.now(timezone.utc).isoformat()}))
+    except OSError as e:
+        log.debug("export stats not recorded: %s", e)
+
+
+def _last_export_stats() -> Dict[str, int]:
+    try:
+        d = json.loads(_EXPORT_STATS_PATH.read_text())
+        if d.get("full_zip_bytes") and d.get("live_bytes"):
+            return {"full_zip_bytes": int(d["full_zip_bytes"]),
+                    "live_bytes": int(d["live_bytes"])}
+    except (OSError, ValueError, TypeError):
+        pass
+    return {}
+
+
+def _full_export_estimate(live_bytes: int, last: Dict[str, int]) -> int:
+    ratio = (last["full_zip_bytes"] / last["live_bytes"]
+             if last and last.get("live_bytes") else _FULL_ZIP_RATIO_DEFAULT)
+    return int(live_bytes * ratio)
+
+
 
 # ── Export: study snapshot ────────────────────────────────────────────────────
 
@@ -470,6 +528,7 @@ async def export_full(request: Request):
         with tempfile.TemporaryDirectory() as _td:
             snap_path = Path(_td) / "water_monitor.db"
             _sanitized_snapshot(snap_path)
+            snap_bytes = snap_path.stat().st_size
             zf.write(str(snap_path), "water_monitor.db")
 
         # Quick Restore JSON — included so the ZIP is self-contained for reinstall
@@ -542,8 +601,9 @@ async def export_full(request: Request):
             "  3. Start the addon — setup wizard is skipped automatically\n"
         ))
 
-    return _download(buf.getvalue(), f"wm_full_export_{_ts()}.zip",
-                     "application/zip")
+    body = buf.getvalue()
+    _record_export_stats(len(body), snap_bytes)
+    return _download(body, f"wm_full_export_{_ts()}.zip", "application/zip")
 
 
 # ── /share pickup + drop-off ─────────────────────────────────────────────────
@@ -1110,17 +1170,17 @@ async def backup_page(request: Request):
     # One COUNT(*) per table — off the loop thread.
     counts = await run_db(_row_counts, db, all_tables)
 
-    try:
-        db_size_bytes = DB_PATH.stat().st_size if DB_PATH.exists() else 0
-    except Exception:
-        db_size_bytes = 0
+    sizes = await run_db(_db_size_facts, db)
+    db_size_bytes = sizes["disk"]
 
     # Estimate history archive size (events + hourly_volume row counts × avg row size)
     event_rows  = counts.get("events", 0)
     volume_rows = counts.get("hourly_volume", 0)
     archive_est = event_rows * 200 + volume_rows * 50   # bytes
-    # Full ZIP is roughly the SQLite file size (compressed)
-    full_est    = int(db_size_bytes * 0.6)
+    # Full ZIP: the in-use pages, compressed at the ratio the last export
+    # measured on this home (see _db_size_facts).
+    last_export = _last_export_stats()
+    full_est    = _full_export_estimate(sizes["live"], last_export)
     # Quick restore is JSON — more verbose than binary; config rows ~350 B each,
     # event rows ~500 B each, hourly volume rows ~120 B each.
     settings_rows = sum(counts.get(t, 0) for t in QUICK_RESTORE_TABLES)
@@ -1141,9 +1201,13 @@ async def backup_page(request: Request):
         "page":                 "backup",
         "counts":               counts,
         "db_size":              fmt(db_size_bytes),
+        "db_live_size":         fmt(sizes["live"]),
+        "db_free_size":         fmt(max(0, db_size_bytes - sizes["live"])),
         "quick_restore_size_est": fmt(quick_est),
         "archive_size_est":     fmt(archive_est),
         "full_size_est":        fmt(full_est),
+        "last_full_export":     (fmt(last_export["full_zip_bytes"])
+                                 if last_export else None),
         "quick_tables":         QUICK_RESTORE_TABLES + QUICK_RESTORE_RECENT,
         "history_tables":       HISTORY_ARCHIVE_TABLES,
         "retention":            retention,

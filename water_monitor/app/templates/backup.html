@@ -4,7 +4,13 @@
 {# ── Title row with DB size on the right ─────────────────────────── #}
 <div class="bk-title-row">
   <h1 class="bk-title">Backup &amp; Restore</h1>
-  <span class="bk-db-size">Database size: <strong>{{ db_size }}</strong></span>
+  {#- On disk vs in use: SQLite keeps the pages deleted rows free inside the
+      file for reuse (it never shrinks), so the file is a high-water mark. An
+      export is written compact, so what ships is the in-use size, then zipped. #}
+  <span class="bk-db-size"
+        title="The file on disk keeps the space freed by deleted rows (purged waveforms, rebuilt events) for reuse — it never shrinks. Exports are written compact, so they start from the in-use size and are then compressed.">
+    Database size: <strong>{{ db_size }}</strong> on disk
+    {%- if db_live_size != db_size %} · {{ db_live_size }} in use{% endif %}</span>
 </div>
 
 {# ── Last automatic backup status ────────────────────────────────── #}
@@ -150,7 +156,8 @@
     <a href="{{ ingress_path }}/backup/export/full"
        class="btn btn-secondary btn-sm">⬇ Download Full Export (.zip)</a>
     <button class="btn btn-secondary btn-sm" onclick="saveFullToShare(this)">💾 Save to /share</button>
-    <span class="bk-size-est">~{{ full_size_est }} estimated</span>
+    <span class="bk-size-est">~{{ full_size_est }} zipped
+      {%- if last_full_export %} (last export {{ last_full_export }}){% else %} (estimated){% endif %}</span>
   </div>
   <div id="share-save-result" class="bk-result" style="display:none"></div>
   <p class="bk-footnote">
