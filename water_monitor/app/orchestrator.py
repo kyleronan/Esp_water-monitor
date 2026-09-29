@@ -32,6 +32,7 @@ from .database import (
     get_sensitivity_config,
     get_valve_type,
     get_weekly_volume,
+    get_write_lock,
     init_db,
     is_circuit_winterized,
     load_cached_admin_ids,
@@ -1273,6 +1274,8 @@ class Orchestrator:
                 self._supervise("pump_regime_detector", self._pump_regime.run),
                 self._supervise("supply_regime_tracker", self._supply_regime.run),
                 self._supervise("waveform_purger",     self._run_waveform_purger),
+                self._supervise("sparkline_tier_refit",
+                                self._run_sparkline_tier_refit),
                 self._supervise("volume_baseline_rollover",
                                 self._run_volume_baseline_rollover),
                 self._supervise("role_sync",           self._run_role_sync),
@@ -2175,6 +2178,24 @@ class Orchestrator:
         )
         self._db.commit()
         return cur.rowcount
+
+    async def _run_sparkline_tier_refit(self) -> None:
+        """Daily: refit each circuit's sparkline size tiers from its own real
+        events (sparkline_tiers.py). First pass shortly after boot, so a new
+        install or an upgrade gets fitted cuts the same day."""
+        from .sparkline_tiers import refit_circuit
+        await asyncio.sleep(60)
+        while not self._stop.is_set():
+            for c in self._cfg.circuits:
+                try:
+                    async with get_write_lock():
+                        await run_db(refit_circuit, self._db, c.circuit,
+                                     c.circuit_type)
+                except Exception as e:
+                    log.warning("[%s] sparkline tier refit failed (non-fatal): %s",
+                                c.circuit, e)
+            if await self._sleep_or_stop(24 * 3600):
+                return
 
     async def _compute_leak_test_etc(
         self,

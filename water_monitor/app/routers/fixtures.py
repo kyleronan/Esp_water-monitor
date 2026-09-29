@@ -242,7 +242,8 @@ def _fixtures_page_payload(orch, range_start_utc):
     health_ctx = {"alerts": [], "queue": {}, "learning": {}, "overlaps": {}}
     try:
         from ..fixture_health import load_baseline, open_alerts
-        from ..review_queue import build_card
+        from ..review_queue import REVIEW_MIN_CONFIDENCE, current_card
+        health_ctx["review_bar_pct"] = round(REVIEW_MIN_CONFIDENCE * 100)
         for circ in circuits_ctx:
             cid = circ["circuit"]
             # What the learning loop has been deciding, from the
@@ -303,23 +304,12 @@ def _fixtures_page_payload(orch, range_start_utc):
                     "unit": _HEALTH_UNITS.get(alert["signal"]),
                 })
             try:
-                card = build_card(orch.db, cid)
+                card = current_card(orch.db, cid)
                 if card.items:
-                    # The card holds two DIFFERENT questions and the template
-                    # has to tell them apart: identity slots are events the
-                    # ladder could not type, anchor slots are events it typed
-                    # confidently and wants confirmed. Describing all of them as
-                    # "could not type confidently" is wrong for the anchors, in
-                    # the direction that matters: it asks the operator to
-                    # identify something already named.
-                    from ..review_queue import KIND_ANCHOR
-                    n_anchor = sum(1 for it in card.items
-                                   if it.kind == KIND_ANCHOR)
                     health_ctx["queue"][cid] = {
                         "shown": len(card.items),
-                        "n_anchor": n_anchor,
-                        "n_identity": len(card.items) - n_anchor,
-                        "waiting": card.n_candidates,
+                        "pool": card.n_candidates,
+                        "picked_on": (card.generated_at or "")[:10],
                         "circuit_name": circ.get("display_name") or cid,
                     }
             except Exception:                       # noqa: BLE001

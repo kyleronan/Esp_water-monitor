@@ -241,8 +241,12 @@ def waveform_time_axis(n_bins: int, duration_s: float, src_n, src_hz):
     anchored at event start — basis ``uniform_exact_unanchored`` (exact
     spacing/span, approximate anchor). Software channel / rows without
     metadata have no recoverable axis, so bins are stretched uniformly across
-    the event window — ``uniform_approx``.
+    the event window — ``uniform_approx``. A software series short enough to
+    be stored unbinned is one point per reading, not per bin, so it spans the
+    window edge to edge: bin centres left a 3-reading event blank for its
+    first and last sixth.
     """
+    from ..feature_extractor import MAX_WAVEFORM_BINS
     if n_bins <= 0:
         return [], "empty"
     if src_hz and src_n:
@@ -250,7 +254,12 @@ def waveform_time_axis(n_bins: int, duration_s: float, src_n, src_hz):
         times = [round((k + 0.5) * span / n_bins, 3) for k in range(n_bins)]
         return times, "uniform_exact_unanchored"
     dur = float(duration_s or 0)
-    times = [round(dur * (k + 0.5) / n_bins, 3) for k in range(n_bins)]
+    if n_bins < MAX_WAVEFORM_BINS:   # _bin_min_max only bins past this length
+        if n_bins == 1:
+            return [0.0], "uniform_approx"
+        times = [round(dur * k / (n_bins - 1), 3) for k in range(n_bins)]
+    else:
+        times = [round(dur * (k + 0.5) / n_bins, 3) for k in range(n_bins)]
     return times, "uniform_approx"
 
 
@@ -409,6 +418,7 @@ def _collect_circuit_history_sync(
     import json
     from ..feature_extractor import (SIGNATURE_POINTS, _wf_resample,
                                      classify_flow_shape, classify_magnitude_tier)
+    from ..sparkline_tiers import cuts_for
     from ..units import load_unit_context
     _units = load_unit_context(db)
     # Overnight pump-watch fallback for the leak-test Pump check column (see
@@ -468,14 +478,13 @@ def _collect_circuit_history_sync(
         # asked for exactly those rows) and by ?show_hidden=1 for one render
         # (presentation-only, viewer-safe).
         # Water Use's "Label on History" link arrives as ?filter=review&circuit=…
-        # The review card is rebuilt here rather than passing ids in the URL so
-        # the list and the card cannot disagree, and because ids in a query
-        # string go stale the moment the card is regenerated.
+        # The stored card is read here rather than passing ids in the URL so
+        # the list and the card cannot disagree.
         _review_ids = None
         if filter_param == "review":
-            from ..review_queue import build_card
+            from ..review_queue import current_card
             _review_ids = [it.event_id for it in
-                           build_card(db, circuit_cfg.circuit).items]
+                           current_card(db, circuit_cfg.circuit).items]
         _hiding_active = (hide_not_real and not show_hidden and not _anomaly_view
                           and _review_ids is None
                           and bar_filters.get("note_kind") != "not_real")
@@ -605,6 +614,7 @@ def _collect_circuit_history_sync(
         # sparkline it sits next to (the stored resistance_curve_shape describes the
         # ΔP/Q pressure load, which can read "pulsed" over a flat-flow rectangle).
         # Derived from the same flow_signature_json the sparkline draws.
+        _tier_cuts = cuts_for(db, circuit_cfg.circuit, circuit_cfg.circuit_type)
         for e in events:
             try:
                 _sig = json.loads(e.get("flow_signature_json") or "[]")
@@ -618,13 +628,10 @@ def _collect_circuit_history_sync(
                 mid_event_flow_drop=e.get("mid_event_flow_drop_lpm"),
                 peak=e.get("peak_flow_lpm"),
             )
-            # Size tier for the sparkline's vertical scale. Use effective volume
-            # so dribble/phantom/cross-talk-zeroed events fall to 'trickle' and
-            # the tier agrees with the gal number shown in the row. The tier
-            # blends peak flow and volume via MAX, so on a ZEROED event the
-            # peak-flow dimension must be suppressed too — a phantom's peak
-            # reflects pressure-window noise, not real flow, and without this
-            # 246 zeroed events rendered medium/large next to "0 gal".
+            # Size tier for the sparkline's vertical scale, from peak flow. A
+            # ZEROED not-real event's peak is pressure-window noise (246 of them
+            # once rendered medium/large next to "0 gal"), so drop it and let
+            # the effective volume (0 → xs) decide.
             _tier_vol = (e.get("volume_litres_effective")
                          if e.get("volume_litres_effective") is not None
                          else e.get("volume_litres"))
@@ -639,6 +646,7 @@ def _collect_circuit_history_sync(
             e["magnitude_tier"] = classify_magnitude_tier(
                 peak_flow_lpm=_tier_peak,
                 volume_litres=_tier_vol,
+                peak_cuts_lpm=_tier_cuts,
             )
             # Embedded fixtures hidden inside this event (a toilet flushed mid-shower).
             # Display-only; the parent's volume/label are unchanged. The label is
@@ -1129,6 +1137,24 @@ def _patch_event_sync(db, event_id: str, circuit: str, payload: dict) -> dict:
                          circuit, kwargs["user_fixture_type"], event_id)
         except Exception:
             log.exception("artifact revert on relabel failed (label saved)")
+
+    # A label set on, or cleared from, a below-floor draw changes which zeroed
+    # draws are its twins (label_twins) — re-judge the circuit's below-floor
+    # rows so they flip in the same click.
+    if "user_fixture_type" in payload:
+        try:
+            from ..feature_extractor import _circuit_min_flow, rejudge_below_floor
+            from ..label_twins import is_below_floor
+            ev = db.execute(
+                "SELECT volume_litres, avg_flow_lpm, true_avg_flow_lpm, "
+                "       peak_flow_lpm, pressure_delta_psi "
+                "FROM events WHERE id = ? AND circuit = ?",
+                (event_id, circuit)).fetchone()
+            if ev and is_below_floor(dict(ev), _circuit_min_flow(db, circuit)):
+                rejudge_below_floor(db, circuit)
+        except Exception:
+            log.exception("label-twin re-judge after relabel failed (label saved)")
+            _rollback_quietly(db)
 
     # Any edit can change what the frozen reference knows and what this event
     # is judged AS: a label or a "Normal use" verdict teaches (it raises the

@@ -135,7 +135,10 @@ def recompute_volume_and_active_flow(
     from .feature_extractor import _finalize_derived_verdicts
     from .artifact_calibration import load_artifact_calibration
 
+    from .label_twins import load_exemplars
+
     _acal = load_artifact_calibration(conn, circuit) or None
+    _twins = load_exemplars(conn, circuit)
     stamp = (now or datetime.now(timezone.utc)).isoformat()
     rows = conn.execute(
         "SELECT id, start_ts, end_ts, duration_seconds, pressure_delta_psi, "
@@ -247,7 +250,8 @@ def recompute_volume_and_active_flow(
                 _pump = _pga(conn, circuit)
             except Exception:
                 _pump = False
-            _finalize_derived_verdicts(feat, _acal, pump_gates=_pump)
+            _finalize_derived_verdicts(feat, _acal, pump_gates=_pump,
+                                       floor_twins=_twins)
             eff = feat["volume_litres_effective"]
             method = feat["volume_estimation_method"]
 

@@ -36,8 +36,8 @@ _BASELINE_VERSION: int = 20260801
 # reorder a shipped number: 20260819 shipped in September under August's prefix
 # and STAYS that way — renumbering it would make the live databases it stamped
 # fail the _UPGRADEABLE_VERSIONS check below and be told to delete themselves.
-# THE NEXT MIGRATION IS 20260906.
-_CURRENT_VERSION: int = 20260905
+# THE NEXT MIGRATION IS 20260908.
+_CURRENT_VERSION: int = 20260907
 
 # Roles removed when the firmware switched waveform delivery from 5 chunked
 # text sensors to a single HA event (firmware 3.8.0). Old DBs may still carry
@@ -1882,6 +1882,42 @@ def _apply_fixture_presence_column(conn: sqlite3.Connection) -> None:
     log.info("Migration 20260905: fixture checklist column ready")
 
 
+def _apply_review_card_table(conn: sqlite3.Connection) -> None:
+    """Forward migration to 20260906 — the weekly review card's stored picks.
+
+    The card was re-picked on every page read, so each answer was backfilled
+    from the backlog and it never went away. Additive and idempotent; the first
+    card is picked once the boot reclassify finishes."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS review_card (
+            circuit        TEXT PRIMARY KEY,
+            generated_at   TEXT NOT NULL,
+            event_ids_json TEXT NOT NULL,
+            pool_n         INTEGER NOT NULL DEFAULT 0
+        )""")
+    conn.commit()
+    log.info("Migration 20260906: review card table ready")
+
+
+def _apply_sparkline_tier_cuts_table(conn: sqlite3.Connection) -> None:
+    """Forward migration to 20260907 — per-circuit sparkline size tiers.
+
+    Additive and idempotent; derived state the daily refit fills
+    (sparkline_tiers.py), so History draws with the type's default until then."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sparkline_tier_cuts (
+            circuit          TEXT PRIMARY KEY,
+            cuts_json        TEXT NOT NULL,
+            sample_n         INTEGER NOT NULL DEFAULT 0,
+            fit_weight       REAL NOT NULL DEFAULT 0,
+            window_start     TEXT,
+            checked_at       TEXT NOT NULL,
+            cuts_updated_at  TEXT NOT NULL
+        )""")
+    conn.commit()
+    log.info("Migration 20260907: sparkline tier cuts table ready")
+
+
 # Ordered forward-migration chain, (introduced_in_version, apply_fn): a DB
 # stamped at V already HAS every step with introduced <= V and needs exactly
 # the steps with introduced > V, in this order. Every apply fn is idempotent,
@@ -1912,6 +1948,8 @@ _MIGRATIONS: tuple = (
     (20260903, _apply_per_type_anomaly_rescore),
     (20260904, _apply_tail_ceiling_and_novelty),
     (20260905, _apply_fixture_presence_column),
+    (20260906, _apply_review_card_table),
+    (20260907, _apply_sparkline_tier_cuts_table),
 )
 
 # Versions a DB may legitimately be stamped with and still be upgradeable.

@@ -54,6 +54,15 @@ class LearningScheduler:
 
     # ── the health pass ─────────────────────────────────────────────────────
     async def run_health(self) -> None:
+        # Pick a due review card once the boot reclassify has settled the
+        # verdicts, rather than waiting for the first nightly pass.
+        while not getattr(self._orch, "startup_cluster_work_done", True):
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=30.0)
+                return
+            except asyncio.TimeoutError:
+                pass
+        await self._review_card_pass()
         while not self._stop.is_set():
             delay = _seconds_until(_HEALTH_HOUR_UTC)
             try:
@@ -61,6 +70,7 @@ class LearningScheduler:
                 return
             except asyncio.TimeoutError:
                 pass
+            await self._review_card_pass()
             try:
                 await self._health_pass()
             except Exception as e:                  # noqa: BLE001
@@ -86,6 +96,19 @@ class LearningScheduler:
             else:
                 log.info("[%s] fixture health: nothing raised (%d fixture(s) "
                          "watched)", circ.circuit, len(out or {}))
+
+    async def _review_card_pass(self) -> None:
+        """Store each circuit's weekly review card when one is due. Never raises."""
+        from .review_queue import refresh_card
+        for circ in self._cfg.circuits:
+            if self._stop.is_set():
+                return
+            try:
+                async with get_write_lock():
+                    await run_db(refresh_card, self._db, circ.circuit)
+            except Exception as e:                  # noqa: BLE001
+                log.warning("[%s] review card refresh failed (non-fatal): %s",
+                            circ.circuit, e)
 
     # ── the retrain ─────────────────────────────────────────────────────────
     async def run_retrain(self) -> None:

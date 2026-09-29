@@ -28,9 +28,10 @@ import sqlite3
 import statistics
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from .event_detector import RawEvent, WaveformRecord
+from .label_twins import twin_type
 
 log = logging.getLogger(__name__)
 
@@ -1348,7 +1349,8 @@ def apply_pinned_verdict(features: dict) -> bool:
 
 def _finalize_derived_verdicts(features: dict, calib=None,
                                min_flow_lpm: float = 0.15,
-                               pump_gates: bool = False) -> None:
+                               pump_gates: bool = False,
+                               floor_twins: Sequence[dict] = ()) -> None:
     """Single source of truth for the artifact verdicts and their dependent fields.
 
     Recomputes IN PLACE from the CURRENT values in ``features``: the artifact
@@ -1363,7 +1365,9 @@ def _finalize_derived_verdicts(features: dict, calib=None,
     only the identifier thresholds; the leak-safety true-flow guards are never
     calibrated. None → shipped defaults. Rows the user has manually classified
     (``user_classified`` == 1) are skipped — their category flags are
-    authoritative and must never be auto-overridden.
+    authoritative and must never be auto-overridden. ``floor_twins`` are the
+    home's labelled below-floor draws (``label_twins.load_exemplars``); a draw
+    matching them is not zeroed.
     """
     # hydraulic_resistance must track the CURRENT ΔP: ESP enrichment overwrites
     # pressure_delta_psi AFTER extract_features computed the ratio (1,324 stale
@@ -1507,6 +1511,9 @@ def _finalize_derived_verdicts(features: dict, calib=None,
             min_flow_lpm=min_flow_lpm,
             true_avg_flow_lpm=features.get("true_avg_flow_lpm"),
             peak_flow_lpm=features.get("peak_flow_lpm"))
+        # A draw matching the home's own labelled below-floor fixture is real,
+        # exactly as a label on it would make it.
+        and not twin_type(features, floor_twins)
     )
     # Pressure-silent flow: validly-metered flow with NO supply
     # response — physically impossible as a real draw (see constants block).
@@ -1924,6 +1931,128 @@ def repair_artifact_flag_consistency(conn: sqlite3.Connection) -> dict:
             "unresolved": unresolved, "rezeroed": rezeroed}
 
 
+def rejudge_below_floor(conn: sqlite3.Connection,
+                        circuit: Optional[str] = None) -> dict:
+    """The below-meter-floor verdict over stored events (one circuit, or all).
+
+    ACTIVE flow that never reached the circuit meter's registration floor is
+    zeroed + excluded regardless of ΔP, volume or duration: the reading is
+    outside the meter's valid regime (see the registration-floor constants) —
+    unless it matches the home's own labelled below-floor draws
+    (``label_twins``). BIDIRECTIONAL: a flagged row the rule no longer matches
+    (an old triple-gate dribble, or a new label twin) is un-flagged and its raw
+    volume restored through the same ledger chokepoint, and a row that stops
+    matching is re-zeroed. Idempotent in both directions. Rows that flip are
+    released for re-classification, which names a twin. Commits.
+    """
+    from .label_twins import load_exemplars
+    out = {"flagged": 0, "restored": 0}
+    if not _events_has_column(conn, "is_low_flow_dribble"):
+        return out
+    has_af = _events_has_column(conn, "true_avg_flow_lpm")
+    uft_guard = (_NO_USER_FIXTURE_TYPE_SQL
+                 if _events_has_column(conn, "user_fixture_type") else "")
+    # Loose SQL prefilter (1.2 covers both class floors); the canonical
+    # detector decides exactly, per-circuit. Arms: (a) not-yet-flagged
+    # sub-floor candidates, (b) every currently-flagged auto dribble — for
+    # re-zeroing (veff>0 self-heal) or restoration.
+    sub_floor = ("(COALESCE(peak_flow_lpm, avg_flow_lpm, 0) < 1.2 "
+                 " AND COALESCE(true_avg_flow_lpm, avg_flow_lpm, 0) < 1.2)"
+                 if has_af else "COALESCE(peak_flow_lpm, avg_flow_lpm, 0) < 1.2")
+    drows = conn.execute(
+        "SELECT id, circuit, start_ts, duration_seconds, volume_litres, "
+        "       avg_flow_lpm, peak_flow_lpm, pressure_delta_psi, "
+        "       integration_quality, "
+        "       COALESCE(user_ignored, 0) AS ui, "
+        "       COALESCE(is_low_flow_dribble, 0) AS dr, "
+        "       COALESCE(volume_litres_effective, volume_litres, 0) AS veff"
+        + (", true_avg_flow_lpm" if has_af else "") +
+        " FROM events WHERE 1=1 "
+        + (" AND circuit = ?" if circuit else "")
+        + _NOT_USER_CLASSIFIED_SQL + uft_guard + _LEAK_REFILL_GUARD_SQL
+        + _NO_PHANTOM_SQL + _NO_CROSS_TALK_SQL + _NO_DEGRADED_SQL +
+        f"  AND (COALESCE(is_low_flow_dribble, 0) = 1 OR {sub_floor})",
+        (circuit,) if circuit else ()).fetchall()
+    twins: Dict[str, list] = {}
+    released: List[str] = []
+    litres_zeroed = 0.0
+    dr_days: set = set()
+    for row in drows:
+        circ = row["circuit"]
+        if circ not in twins:
+            twins[circ] = load_exemplars(conn, circ)
+        below = (_detect_low_flow_dribble(
+                    row["volume_litres"], row["avg_flow_lpm"],
+                    row["pressure_delta_psi"],
+                    min_flow_lpm=_circuit_min_flow(conn, circ),
+                    true_avg_flow_lpm=(row["true_avg_flow_lpm"] if has_af else None),
+                    peak_flow_lpm=row["peak_flow_lpm"])
+                 and not twin_type(dict(row), twins[circ]))
+        if below and (not row["dr"] or float(row["veff"] or 0.0) > 0.0):
+            with transaction(conn):
+                conn.execute(
+                    "UPDATE events SET "
+                    "  is_low_flow_dribble = 1, "
+                    "  volume_litres_effective = 0, "
+                    "  volume_estimation_method = ?, "
+                    "  excluded_from_training = 1, "
+                    "  match_rejection_reason = ? "
+                    "WHERE id = ?",
+                    (BELOW_METER_FLOOR_REASON, BELOW_METER_FLOOR_REASON,
+                     row["id"]),
+                )
+                # §2.5 — zero the ledger contribution via the one chokepoint.
+                apply_effective_volume(conn, row["id"], circ, row["start_ts"], 0)
+            out["flagged"] += 1
+            litres_zeroed += float(row["veff"] or 0.0)
+            if not row["dr"]:
+                released.append(row["id"])
+        elif not below and row["dr"]:
+            # A dribble the floor rule no longer zeroes — restore.
+            raw_vol = float(row["volume_litres"] or 0.0)
+            restored_excluded = 1 if (
+                row["ui"] or row["integration_quality"] == "degraded") else 0
+            # An exclusion that survives the restore keeps a reason: this
+            # runs on EVERY boot, and writing NULL here was the busiest
+            # producer of "excluded, no reason recorded".
+            restored_reason = (
+                USER_IGNORED_REASON if row["ui"]
+                else INTEGRATION_DEGRADED_REASON if restored_excluded
+                else None)
+            with transaction(conn):
+                conn.execute(
+                    "UPDATE events SET "
+                    "  is_low_flow_dribble = 0, "
+                    "  volume_litres_effective = ?, "
+                    "  volume_estimation_method = 'raw', "
+                    "  excluded_from_training = ?, "
+                    "  match_rejection_reason = ? "
+                    "WHERE id = ?",
+                    (round(raw_vol, 3), restored_excluded, restored_reason,
+                     row["id"]),
+                )
+                apply_effective_volume(conn, row["id"], circ, row["start_ts"],
+                                       raw_vol)
+            out["restored"] += 1
+            released.append(row["id"])
+        else:
+            continue
+        day = local_day_of(row["start_ts"])
+        if day:
+            dr_days.add((circ, day))
+    for circ, day in dr_days:
+        compute_daily_summary(conn, circ, day)
+    if released and _events_has_column(conn, "verdict_stamp"):
+        from .reclassify import invalidate_verdict_stamps
+        invalidate_verdict_stamps(conn, released)
+    if out["flagged"] or out["restored"]:
+        conn.commit()
+        log.info("below-meter-floor reprocess: %d event(s) zeroed "
+                 "(%.2f L removed), %d restored, across %d day(s)",
+                 out["flagged"], litres_zeroed, out["restored"], len(dr_days))
+    return out
+
+
 def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
     """Recompute the auto exclusion verdicts over all events.
 
@@ -2052,117 +2181,9 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
         log.info("phantom-reprocess: flagged %d event(s) total across %d day(s)",
                  flagged, len(affected_days))
 
-    # ── Scan 2: below-meter-floor ─────────────────────────────────────────────
-    # ACTIVE flow that never reached the circuit meter's registration floor is
-    # zeroed + excluded regardless of ΔP, volume or duration: the reading is
-    # outside the meter's valid regime (see the registration-floor constants).
-    # BIDIRECTIONAL: a row the OLD triple-gate flagged that the floor rule does
-    # NOT match (a brief valid-regime burst that averaged low) is un-flagged and
-    # its raw volume restored through the same ledger chokepoint. Idempotent in
-    # both directions.
-    dribbles_flagged = 0
-    dribbles_restored = 0
-    litres_zeroed = 0.0
-    dr_days: set = set()
-    if _events_has_column(conn, "is_low_flow_dribble"):
-        af_cols = (", true_avg_flow_lpm" if has_af else "")
-        # Loose SQL prefilter (1.2 covers both class floors); the canonical
-        # detector decides exactly, per-circuit. Arms: (a) not-yet-flagged
-        # sub-floor candidates, (b) every currently-flagged auto dribble —
-        # for re-zeroing (veff>0 self-heal) or restoration under the new rule.
-        drows = conn.execute(
-            "SELECT id, circuit, start_ts, volume_litres, avg_flow_lpm, "
-            "       peak_flow_lpm, pressure_delta_psi, integration_quality, "
-            "       COALESCE(user_ignored, 0) AS ui, "
-            "       COALESCE(is_low_flow_dribble, 0) AS dr, "
-            "       COALESCE(volume_litres_effective, volume_litres, 0) AS veff"
-            + af_cols +
-            " FROM events "
-            "WHERE 1=1 "
-            + _NOT_USER_CLASSIFIED_SQL + uft_guard + _LEAK_REFILL_GUARD_SQL
-            + _NO_PHANTOM_SQL + _NO_CROSS_TALK_SQL + _NO_DEGRADED_SQL +
-            "  AND (COALESCE(is_low_flow_dribble, 0) = 1 "
-            "       OR (COALESCE(peak_flow_lpm, avg_flow_lpm, 0) < 1.2 "
-            "           AND COALESCE(true_avg_flow_lpm, avg_flow_lpm, 0) < 1.2))"
-            if has_af else
-            "SELECT id, circuit, start_ts, volume_litres, avg_flow_lpm, "
-            "       peak_flow_lpm, pressure_delta_psi, integration_quality, "
-            "       COALESCE(user_ignored, 0) AS ui, "
-            "       COALESCE(is_low_flow_dribble, 0) AS dr, "
-            "       COALESCE(volume_litres_effective, volume_litres, 0) AS veff "
-            "FROM events "
-            "WHERE 1=1 "
-            + _NOT_USER_CLASSIFIED_SQL + uft_guard + _LEAK_REFILL_GUARD_SQL
-            + _NO_PHANTOM_SQL + _NO_CROSS_TALK_SQL + _NO_DEGRADED_SQL +
-            "  AND (COALESCE(is_low_flow_dribble, 0) = 1 "
-            "       OR COALESCE(peak_flow_lpm, avg_flow_lpm, 0) < 1.2)"
-        ).fetchall()
-        for row in drows:
-            below = _detect_low_flow_dribble(
-                row["volume_litres"], row["avg_flow_lpm"],
-                row["pressure_delta_psi"],
-                min_flow_lpm=_circuit_min_flow(conn, row["circuit"]),
-                true_avg_flow_lpm=(row["true_avg_flow_lpm"] if has_af else None),
-                peak_flow_lpm=row["peak_flow_lpm"],
-            )
-            if below and (not row["dr"] or float(row["veff"] or 0.0) > 0.0):
-                with transaction(conn):
-                    conn.execute(
-                        "UPDATE events SET "
-                        "  is_low_flow_dribble = 1, "
-                        "  volume_litres_effective = 0, "
-                        "  volume_estimation_method = ?, "
-                        "  excluded_from_training = 1, "
-                        "  match_rejection_reason = ? "
-                        "WHERE id = ?",
-                        (BELOW_METER_FLOOR_REASON, BELOW_METER_FLOOR_REASON,
-                         row["id"]),
-                    )
-                    # §2.5 — zero the ledger contribution via the one chokepoint.
-                    apply_effective_volume(conn, row["id"], row["circuit"],
-                                           row["start_ts"], 0)
-                dribbles_flagged += 1
-                litres_zeroed += float(row["veff"] or 0.0)
-            elif not below and row["dr"]:
-                # Old-rule dribble the floor rule does not match — restore.
-                raw_vol = float(row["volume_litres"] or 0.0)
-                restored_excluded = 1 if (
-                    row["ui"] or row["integration_quality"] == "degraded") else 0
-                # An exclusion that survives the restore keeps a reason: this
-                # runs on EVERY boot, and writing NULL here was the busiest
-                # producer of "excluded, no reason recorded".
-                restored_reason = (
-                    USER_IGNORED_REASON if row["ui"]
-                    else INTEGRATION_DEGRADED_REASON if restored_excluded
-                    else None)
-                with transaction(conn):
-                    conn.execute(
-                        "UPDATE events SET "
-                        "  is_low_flow_dribble = 0, "
-                        "  volume_litres_effective = ?, "
-                        "  volume_estimation_method = 'raw', "
-                        "  excluded_from_training = ?, "
-                        "  match_rejection_reason = ? "
-                        "WHERE id = ?",
-                        (round(raw_vol, 3), restored_excluded, restored_reason,
-                         row["id"]),
-                    )
-                    apply_effective_volume(conn, row["id"], row["circuit"],
-                                           row["start_ts"], raw_vol)
-                dribbles_restored += 1
-            else:
-                continue
-            day = local_day_of(row["start_ts"])
-            if day:
-                dr_days.add((row["circuit"], day))
-        for circ, day in dr_days:
-            compute_daily_summary(conn, circ, day)
-        if dribbles_flagged or dribbles_restored:
-            conn.commit()
-            log.info("below-meter-floor reprocess: %d event(s) zeroed "
-                     "(%.2f L removed), %d old-rule dribble(s) restored, "
-                     "across %d day(s)", dribbles_flagged, litres_zeroed,
-                     dribbles_restored, len(dr_days))
+    # ── Scan 2: below-meter-floor (bidirectional, see rejudge_below_floor) ──
+    _dr = rejudge_below_floor(conn)
+    dribbles_flagged, dribbles_restored = _dr["flagged"], _dr["restored"]
 
     # ── Scan 3: cross-talk (no real flow + a REAL pressure drop ≥ 2.0) ────────
     # Another circuit's draw pulled this circuit's pressure down — registered but
@@ -3250,38 +3271,40 @@ def classify_flow_shape(signature, *, steady_state_fraction=None,
 
 # ── Sparkline size tiers ─────────────────────────────────────────────────────
 # The peak-normalised flow_signature fills the same height for every event, so
-# these tiers scale the sparkline's vertical band to convey size. STORED units
-# (L/min peak, litres) so they are unit-independent; presentation heuristics,
-# tunable. Blended: an event is as big as its LARGER dimension.
-_MAG_FLOW_LPM = (2.0, 6.0, 15.0)     # trickle ≤2 < small ≤6 < medium ≤15 < large
-_MAG_VOLUME_L = (1.0, 8.0, 40.0)     # trickle ≤1 < small ≤8 < medium ≤40 < large
-_MAG_TIERS = ("trickle", "small", "medium", "large")
+# these tiers set the sparkline's height from PEAK FLOW: the curve is a flow
+# trace on a fixed-width axis, so its height reads as flow — a hose full
+# height, a tap low. The peak cuts are each circuit's own fifths, refit daily
+# (sparkline_tiers.py); this default is the fixture-circuit starting point.
+from .sparkline_tiers import default_cuts_lpm as _default_tier_cuts  # noqa: E402
+_MAG_PEAK_LPM = _default_tier_cuts("fixture")
+_MAG_VOLUME_L = (0.5, 4.0, 20.0, 100.0)  # fallback only, when peak is unusable
+_MAG_TIERS = ("xs", "small", "medium", "large", "xl")
 
 
-def classify_magnitude_tier(peak_flow_lpm=None, volume_litres=None) -> str:
-    """4-tier event-size bucket for the History sparkline's vertical scale.
+def classify_magnitude_tier(peak_flow_lpm=None, volume_litres=None,
+                            peak_cuts_lpm=None) -> str:
+    """5-tier event-size bucket for the History sparkline's vertical scale.
 
-    Blends peak flow and volume by taking the LARGER of the two per-dimension
-    tiers, so a high-flow-short event and a low-flow-long event both read big.
-    Inputs are in stored units (L/min, litres). Returns one of:
-    trickle | small | medium | large | unknown (when neither input is usable).
+    Tiered by peak flow against ``peak_cuts_lpm`` (the circuit's fitted cuts;
+    the fixture default when omitted); volume is used only when peak is
+    missing or unusable. Inputs are in stored units (L/min, litres). Returns
+    one of: xs | small | medium | large | xl | unknown (neither input usable).
     """
     def _tier(val, bounds):
         try:
             v = float(val) if val is not None else None
         except (TypeError, ValueError):
             return None
-        if v is None:
+        if v is None or not math.isfinite(v):   # NaN would fall through to xl
             return None
         for i, b in enumerate(bounds):
             if v <= b:
                 return i
         return len(bounds)            # above the top bound → last tier index
-    idxs = [i for i in (_tier(peak_flow_lpm, _MAG_FLOW_LPM),
-                        _tier(volume_litres, _MAG_VOLUME_L)) if i is not None]
-    if not idxs:
-        return "unknown"
-    return _MAG_TIERS[max(idxs)]
+    idx = _tier(peak_flow_lpm, peak_cuts_lpm or _MAG_PEAK_LPM)
+    if idx is None:
+        idx = _tier(volume_litres, _MAG_VOLUME_L)
+    return "unknown" if idx is None else _MAG_TIERS[idx]
 
 
 def _pressure_signature(

@@ -38,6 +38,7 @@ from .feature_extractor import (
     log,
 )
 from .config import DB_PATH, pump_gates_active, pump_gates_active as _pga
+from .label_twins import twin_for_event
 from .database import (
     drain_daily_summary_dirty,
     find_overlapping_event,
@@ -358,14 +359,17 @@ class FeatureExtractor:
         return {"blocking": blocking, "existing": existing}
 
     def _verdict_inputs_sync(self, circuit) -> dict:
-        """Frozen artifact calibration + pump-gate state."""
+        """Frozen artifact calibration + pump-gate state + labelled below-floor
+        draws (label_twins)."""
         from .artifact_calibration import load_artifact_calibration
+        from .label_twins import load_exemplars
         acal = load_artifact_calibration(self._db, circuit)
         try:
             pump = pump_gates_active(self._db, circuit)
         except Exception:
             pump = False
-        return {"acal": acal or None, "pump": pump}
+        return {"acal": acal or None, "pump": pump,
+                "twins": load_exemplars(self._db, circuit)}
 
     def _post_store_sync(self, event, features: dict, wf_record, wf_applied,
                          is_new_event) -> None:
@@ -603,7 +607,8 @@ class FeatureExtractor:
                 _acal, _pump = _vi["acal"], _vi["pump"]
                 _finalize_derived_verdicts(features, _acal or None,
                                            min_flow_lpm=min_flow_lpm,
-                                           pump_gates=_pump)
+                                           pump_gates=_pump,
+                                           floor_twins=_vi["twins"])
 
             # Atomic upsert + hourly_volume update. Uses
             # volume_litres_effective (which is volume_litres for healthy
@@ -1290,6 +1295,11 @@ class FeatureExtractor:
                 matched_fixture_type, matched_via = ("dishwasher",
                                                      "dishwasher_cycle")
                 cycle_group_id = dishwasher_members[event_id][1]
+            elif (not features.get("is_low_flow_dribble")
+                  and (_twin := twin_for_event(self._db, circuit, features))):
+                # Below the meter floor, kept real because it matches the
+                # home's own labelled draws — named after them (label_twins).
+                matched_fixture_type, matched_via = _twin, "label_twin"
             else:
                 try:
                     _pump = _pga(self._db, circuit)

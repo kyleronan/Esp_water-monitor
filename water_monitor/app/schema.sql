@@ -1630,6 +1630,29 @@ CREATE INDEX IF NOT EXISTS idx_fixture_health_alert_open
 -- constraint index column for column. It was also created by migration
 -- 20260811; that copy is gone too.
 
+-- The weekly review card (migration 20260906): one row per circuit, replaced
+-- weekly by the nightly pass. The card shows the stored picks still unanswered
+-- and never backfills (review_queue.py).
+CREATE TABLE IF NOT EXISTS review_card (
+    circuit        TEXT PRIMARY KEY,
+    generated_at   TEXT NOT NULL,
+    event_ids_json TEXT NOT NULL,
+    pool_n         INTEGER NOT NULL DEFAULT 0
+);
+
+-- Per-circuit sparkline size tiers (migration 20260907): four ascending
+-- peak-flow cuts in L/min, refit daily from the circuit's real events
+-- (sparkline_tiers.py). Derived state — not backed up.
+CREATE TABLE IF NOT EXISTS sparkline_tier_cuts (
+    circuit          TEXT PRIMARY KEY,
+    cuts_json        TEXT NOT NULL,
+    sample_n         INTEGER NOT NULL DEFAULT 0,
+    fit_weight       REAL NOT NULL DEFAULT 0,
+    window_start     TEXT,
+    checked_at       TEXT NOT NULL,
+    cuts_updated_at  TEXT NOT NULL
+);
+
 -- ==========================================================================
 -- DATA RETENTION CONFIGURATION
 -- Controls how aggressively old history is pruned.

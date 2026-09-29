@@ -11,17 +11,18 @@ The model hash must stay OUT of ``compute_verdict_stamp``: that stamp is GLOBAL,
 so a model hash inside it re-derives the whole history on every retrain (the
 same trap the stamp's own docstring records for the label pool). A retrain
 instead invalidates only what the new model can change — events with no stored
-classification, machine verdicts below the NEW threshold, and everything after
-the retrain. User labels and confident verdicts from a model that passed the
-referee's non-inferiority test are never touched; ``_code_fingerprint`` in the
-stamp still sweeps everything on a release.
+classification, machine verdicts below the NEW threshold, everything after the
+retrain, and the model tier's own verdicts from the last
+``RECHECK_WINDOW_DAYS`` (an earlier model can be confident about an event whose
+class it had no labels for). User labels and older confident verdicts are never
+touched; ``_code_fingerprint`` in the stamp still sweeps everything on a release.
 """
 from __future__ import annotations
 
 import logging
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from . import burst_features as bf
@@ -500,6 +501,9 @@ def split_holdout(pool: Sequence[dict], fraction: float = 0.25
 
 
 # ── scoped invalidation (see module docstring) ──────────────────────────────
+RECHECK_WINDOW_DAYS: int = 28
+
+
 def scoped_invalidation_ids(conn: sqlite3.Connection, circuit: str,
                             new_threshold: float,
                             trained_at: Optional[str] = None) -> List[str]:
@@ -525,6 +529,19 @@ def scoped_invalidation_ids(conn: sqlite3.Connection, circuit: str,
                 "  AND (user_fixture_type IS NULL OR user_fixture_type = '')",
                 (circuit, trained_at)):
             ids.append(str(r[0]))
+    # Confident verdicts from EARLIER models, recent ones only: a class labelled
+    # after those fits (the fridge) could otherwise never reach them.
+    try:
+        anchor = datetime.fromisoformat(str(trained_at)) if trained_at else None
+    except ValueError:
+        anchor = None
+    since = ((anchor or datetime.now(timezone.utc))
+             - timedelta(days=RECHECK_WINDOW_DAYS)).isoformat()
+    for r in conn.execute(
+            "SELECT id FROM events WHERE circuit = ? AND start_ts >= ? "
+            "  AND (user_fixture_type IS NULL OR user_fixture_type = '') "
+            "  AND matched_via = 'tinymodel'", (circuit, since)):
+        ids.append(str(r[0]))
     return sorted(set(ids))
 
 

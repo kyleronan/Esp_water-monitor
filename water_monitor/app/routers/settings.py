@@ -322,6 +322,7 @@ async def settings_page(request: Request):
     from ..anomaly_baseline import MIN_N_FOR_SHUTOFF, MIN_LIVE_DAYS_FOR_SHUTOFF
     _home_tz = get_home_timezone()
     from ..supply_regime import get_current_regime_id
+    from ..sparkline_tiers import load_status as load_tier_status
 
     def _per_circuit_db():
         """Every per-circuit DB read (~10 queries per circuit) in ONE hop, off
@@ -343,6 +344,7 @@ async def settings_page(request: Request):
                 "incomplete_reseed": get_incomplete_reseed(orch.db, cid),
                 "reconcile": get_reconcile_state(orch.db, cid),
                 "exclusion": get_active_exclusion_window(orch.db, cid),
+                "tier_status": load_tier_status(orch.db, cid),
             }
         return out
 
@@ -414,6 +416,13 @@ async def settings_page(request: Request):
             "detector_validation": _localize_validation(dv, _home_tz) if dv else None,
             "device_entities": entities_by_circuit.get(c, []),
             "active_exclusion": _row["exclusion"],
+            # Sparkline size tiers fitted to this circuit (Dev Tools, read-only).
+            "tier_status": ({**_row["tier_status"],
+                             "checked_at": _fmt_local_ts(
+                                 _row["tier_status"]["checked_at"], _home_tz),
+                             "window_start": _fmt_local_ts(
+                                 _row["tier_status"]["window_start"], _home_tz)}
+                            if _row["tier_status"] else None),
         })
 
     from ..fixtures import (CIRCUIT_TYPES, CIRCUIT_TYPE_LABELS, CIRCUIT_TYPE_HELP,

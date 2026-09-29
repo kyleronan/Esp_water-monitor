@@ -1333,6 +1333,37 @@
         </form>
       </div>
 
+      {#- Read-only: each circuit's fitted sparkline cuts (sparkline_tiers.py). #}
+      <div class="sett-card" id="sett-sparkline-tiers">
+        <h3 class="sett-card-title">Sparkline size tiers</h3>
+        <p style="margin:.25rem 0 .75rem">
+          A History sparkline's height is its event's peak flow, in five sizes cut
+          so each holds about a fifth of the circuit's real events. Refit daily
+          from the current supply regime: a circuit starts on a default, blends
+          toward its own split from 50 events and is fully its own at 250.
+        </p>
+        {% for c in circuits %}
+        {% set t = c.tier_status %}
+        <div style="margin:.6rem 0">
+          <strong>{{ c.display_name }}</strong>
+          <div class="muted" style="font-size:.85em">
+            {% if t %}
+            XS ≤ {{ "%.*f"|format(flow_decimals, t.cuts[0] * flow_factor) }}
+            · S ≤ {{ "%.*f"|format(flow_decimals, t.cuts[1] * flow_factor) }}
+            · M ≤ {{ "%.*f"|format(flow_decimals, t.cuts[2] * flow_factor) }}
+            · L ≤ {{ "%.*f"|format(flow_decimals, t.cuts[3] * flow_factor) }} {{ flow_unit }}
+            · XL above<br>
+            {{ t.sample_n }} real events since {{ t.window_start or '—' }}
+            · {{ (t.fit_weight * 100)|round|int }}% own split
+            · checked {{ t.checked_at or '—' }}
+            {% else %}
+            Default split — the first fit runs a minute after the add-on starts.
+            {% endif %}
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+
       <div class="sett-card">
         <h3 class="sett-card-title">Re-train rule calibration</h3>
         <p style="margin:.25rem 0 .75rem">
@@ -1631,6 +1662,15 @@
           </div>
         </div>
         {% endfor %}
+        <script>
+        // Start/end push each other like the History pickers (no locking bounds).
+        document.querySelectorAll('input[id^="repro-start-"]').forEach(function (s) {
+          const e = document.getElementById(s.id.replace('repro-start-', 'repro-end-'));
+          if (!e) return;
+          s.addEventListener('change', function () { if (e.value && s.value > e.value) e.value = s.value; });
+          e.addEventListener('change', function () { if (s.value && e.value < s.value) s.value = e.value; });
+        });
+        </script>
       </div>
     </div>
     {% endif %}

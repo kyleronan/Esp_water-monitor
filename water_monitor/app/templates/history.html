@@ -68,12 +68,12 @@
 {% elif filter_param == 'anomaly_unreviewed' %}
 {% call filter_banner('anomaly', 'Show all unusual') %}showing unusual events still waiting for your review — the ones the dashboard card counts. Open one and pick a verdict; it leaves this list once reviewed.{% endcall %}
 {% elif filter_param == 'review' %}
-{% call filter_banner() %}showing just the events from the Water Use
-  list — the handful where your answer teaches the app the most. Star-label the
-  ones you recognise. If you cannot tell what one was, ignore it rather than
-  guessing: that keeps the guess out of what the app learns and stops it coming
-  back. Answering is optional, and they keep their current best guess either
-  way.{% endcall %}
+{% call filter_banner() %}showing this week's events from the Water Use
+  card — ones the app isn't confident about. Star-label the ones you recognise.
+  If you cannot tell what one was, ignore it rather than guessing: that keeps the
+  guess out of what the app learns. Each answer takes it off the list; the card
+  goes away when the list is empty, and a new set is picked next week. Answering
+  is optional, and they keep their current best guess either way.{% endcall %}
 {% endif %}
 
 {# ── Filter bar: date · duration · ΔP · volume · fixture · note ─────────── #}
@@ -85,15 +85,11 @@
     <div class="hist-filter-row">
       <div class="hist-filter-group">
         <label class="hist-filter-label" for="from">From</label>
-        <input type="date" id="from" name="from"
-               value="{{ date_from }}"
-               max="{{ date_to or '' }}">
+        <input type="date" id="from" name="from" value="{{ date_from }}">
       </div>
       <div class="hist-filter-group">
         <label class="hist-filter-label" for="to">To</label>
-        <input type="date" id="to" name="to"
-               value="{{ date_to }}"
-               min="{{ date_from or '' }}">
+        <input type="date" id="to" name="to" value="{{ date_to }}">
       </div>
 
       <div class="hist-filter-group hf-range"
@@ -262,6 +258,16 @@
 (function () {
   const form = document.getElementById('hist-filter-form');
   if (!form) return;
+
+  // Date pickers push each other rather than locking (a static min/max
+  // pinned the picker to the page-load range, so 13→14 needed a reload).
+  const dFrom = form.querySelector('#from'), dTo = form.querySelector('#to');
+  dFrom.addEventListener('change', function () {
+    if (dTo.value && dFrom.value > dTo.value) dTo.value = dFrom.value;
+  });
+  dTo.addEventListener('change', function () {
+    if (dFrom.value && dTo.value < dFrom.value) dFrom.value = dTo.value;
+  });
 
   form.querySelectorAll('.hf-range').forEach(function (group) {
     const max  = parseFloat(group.dataset.hfMax || '1') || 1;
@@ -689,16 +695,16 @@
           {% set spark_fill   = {'steady': 'oklch(55% .18 240/.12)', 'rising': 'oklch(65% .18 80/.12)', 'falling': 'oklch(50% .18 145/.12)', 'pulsed': 'oklch(55% .05 240/.10)'} %}
           {# Vertical band the waveform fills, by event size tier — gives the #}
           {# sparkline a sense of scale. Read by the row canvas AND the modal #}
-          {# flow chart so they agree. unknown/missing → 0.65 (small): an     #}
+          {# flow chart so they agree. unknown/missing → 0.5 (small): an      #}
           {# unsized event must not masquerade as a full-height large draw.   #}
-          {% set spark_scale  = {'trickle': 0.45, 'small': 0.65, 'medium': 0.82, 'large': 1.0} %}
+          {% set spark_scale  = {'xs': 0.3, 'small': 0.5, 'medium': 0.68, 'large': 0.84, 'xl': 1.0} %}
           <td class="hist-td hist-td-mono">
             <div class="shape-cell">
               <span>{{ (_row_vol * vol_factor)|round(vol_decimals) if _row_vol is not none else "—" }} {{ vol_unit if _row_vol is not none else '' }}</span>
               {% if e.flow_signature_json and e.flow_signature_json not in ('null', 'None', '') %}
               <canvas class="shape-spark" width="48" height="20"
                       data-sig="{{ e.flow_signature_json }}"
-                      data-spark-scale="{{ spark_scale.get(e.magnitude_tier, 0.65) }}"
+                      data-spark-scale="{{ spark_scale.get(e.magnitude_tier, 0.5) }}"
                       data-stroke="{{ spark_stroke.get(shape, 'oklch(55% .05 240/.55)') }}"
                       data-fill="{{ spark_fill.get(shape,   'oklch(55% .05 240/.08)') }}"></canvas>
               {% endif %}
@@ -716,7 +722,7 @@
               <span class="pill pill-green">{{ e.fixture_display_name }}</span>
             {% elif e.matched_fixture_type %}
               {% set _via = e.matched_via or '' %}
-              <span class="pill pill-neutral" title="{% if _via == 'washer_cycle' %}Matched by washer cycle pattern — anchor fill plus same-peak top-offs/rinses{% elif _via == 'softener_session' %}Matched by water-softener regeneration (scheduled overnight cycle){% elif _via == 'zone_default' %}Zone-circuit default — long high-flow run on an irrigation circuit{% elif _via == 'fingerprint' %}Waveform fingerprint — this event's flow/pressure trace closely matches an event you labeled{% elif _via.startswith('rule_') %}Matched by structural rule (volume/duration/pressure shape){% else %}Auto-matched from your labels{% endif %}">~ {{ fixture_type_labels.get(e.matched_fixture_type, e.matched_fixture_type | replace('_',' ') | title) }}</span>
+              <span class="pill pill-neutral" title="{% if _via == 'washer_cycle' %}Matched by washer cycle pattern — anchor fill plus same-peak top-offs/rinses{% elif _via == 'softener_session' %}Matched by water-softener regeneration (scheduled overnight cycle){% elif _via == 'zone_default' %}Zone-circuit default — long high-flow run on an irrigation circuit{% elif _via == 'fingerprint' %}Waveform fingerprint — this event's flow/pressure trace closely matches an event you labeled{% elif _via == 'label_twin' %}Below what the meter can measure, but it matches draws you labeled, so it counts as real use{% elif _via.startswith('rule_') %}Matched by structural rule (volume/duration/pressure shape){% else %}Auto-matched from your labels{% endif %}">~ {{ fixture_type_labels.get(e.matched_fixture_type, e.matched_fixture_type | replace('_',' ') | title) }}</span>
             {% elif e.suggested_type %}
               <span class="pill pill-neutral" title="{{ (e.suggested_confidence * 100)|int }}% confidence">{{ fixture_type_labels.get(e.suggested_type, e.suggested_type | replace('_',' ') | title) }}</span>
             {% else %}
@@ -1708,11 +1714,17 @@ document.addEventListener('DOMContentLoaded', () => {
         if (wfChart) { wfChart.destroy(); wfChart = null; }
         const timeAxis = !!(ax && Array.isArray(ax.tf)
                             && ax.tf.length === fPts.length);
+        const fData = timeAxis
+          ? fPts.map((v, i) => ({ x: ax.tf[i], y: (Number(v) || 0) * wfScale }))
+          : fPts.map(v => (Number(v) || 0) * wfScale);     // size-tier band
+        // An event-driven series often opens at full rate (pulse_meter's
+        // first period); draw the onset from zero, as the signature does.
+        if (timeAxis && ax.fBasis === 'uniform_approx' && fData[0].y > 0) {
+          fData.unshift({ x: 0, y: 0 });
+        }
         const datasets = [{
           label: 'Flow',
-          data: timeAxis
-            ? fPts.map((v, i) => ({ x: ax.tf[i], y: (Number(v) || 0) * wfScale }))
-            : fPts.map(v => (Number(v) || 0) * wfScale),   // size-tier band
+          data: fData,
           borderColor: cssVar('--accent'),
           backgroundColor: mix(cssVar('--accent'), 12),
           fill: true, tension: hiRes ? 0 : 0.3, pointRadius: 0, borderWidth: 1.5,
@@ -1772,7 +1784,7 @@ document.addEventListener('DOMContentLoaded', () => {
         wfMeta.textContent =
           `${source}${resText} · ${fPts.length} samples · ${channels}${pkText}${dpText}`;
         const note = document.createElement('span');
-        let noteText = 'Flow curve height reflects the event\'s size tier; values are normalized, not actual units.';
+        let noteText = 'Flow curve height reflects the event\'s peak-flow tier; values are normalized, not actual units.';
         if (timeAxis) {
           // Basis caveats from the API.
           if (ax.fBasis === 'uniform_exact_unanchored'

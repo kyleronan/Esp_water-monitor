@@ -155,64 +155,49 @@
 {% endfor %}
 {% endif %}
 
-{# ── The weekly review queue. Deliberately a POINTER to History
-     rather than a second labelling interface — History already does this, and
-     two ways to label the same event is how they drift apart. ──────────── #}
+{# ── The weekly review card: ONE card for every circuit, holding the picks
+     stored for the week (review_queue.py). It only shrinks until next week's.
+     Deliberately a POINTER to History rather than a second labelling
+     interface — two ways to label the same event is how they drift apart. ─ #}
 {% if health and health.queue %}
-{% for cid, q in health.queue.items() %}
+{% set qs = health.queue.values() | list %}
+{% set q_total = qs | sum(attribute='shown') %}
 <div class="fx-msg fx-msg-ok" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
   <span>
-    {#- Two different questions share this card, and the wording must keep them
-        apart. Identity slots are events the ladder could not type; anchor slots
-        are events it typed confidently and wants confirmed. #}
-    <strong>{{ q.shown }}</strong> event{{ '' if q.shown == 1 else 's' }} on
-    {{ q.circuit_name }} would be worth a quick look —
-    {%- if not q.n_anchor %} the app could not type
-      {{ 'it' if q.shown == 1 else 'them' }} confidently.
-    {%- elif not q.n_identity %} the app named
-      {{ 'it' if q.shown == 1 else 'them' }} itself and would like you to confirm
-      {{ 'it' if q.shown == 1 else 'them' }}.
-    {%- else %} {{ q.n_identity }} the app could not type confidently, and
-      {{ q.n_anchor }} it named itself and would like you to confirm.
-    {%- endif %}
-    {#- `waiting` counts the untyped pool only, so it is compared against the
-        identity slots — not the whole card, which the anchors inflate. #}
-    {% if q.n_identity and q.waiting > q.n_identity %}
-      ({{ q.waiting }} are unmatched in total; {{ 'this is the one' if q.n_identity == 1
-        else 'these are the %d'|format(q.n_identity) }} where your answer
-      teaches it the most.)
-    {% endif %}
+    <strong>{{ q_total }} event{{ '' if q_total == 1 else 's' }}
+    {%- if qs|length == 1 %} on {{ qs[0].circuit_name }}{% endif %} worth a quick look</strong>
+    {%- if qs|length > 1 %} ({% for q in qs %}{{ q.circuit_name }} {{ q.shown }}{{ ', ' if not loop.last }}{% endfor %}){% endif %} —
+    from the past week, where the app is under {{ health.review_bar_pct }}% sure.
     {#- "I cannot tell" needs somewhere to go. Without this the only options
         are to guess — which puts a wrong label into training — or to leave it,
         which keeps it in the card forever. Ignore is neither: it is recorded as
         a deliberate non-answer, and it is already excluded from training. #}
-    If you cannot tell what {{ 'it' if q.shown == 1 else 'one of them' }} was,
-    ignore it on History rather than guessing — that is a real answer, it keeps
-    the guess out of what the app learns, and it stops that event coming back.
+    Can't tell what one was? Ignore it on History rather than guessing. The card
+    goes away once they're answered; a new set comes next week.
   </span>
-  {#- Filtered to exactly the events this card is talking about. Linking to
-      the bare page left the operator on an unfiltered list of the newest 100
-      events with no way to tell which twelve were meant. #}
+  {% for cid, q in health.queue.items() %}
   <a class="btn btn-ghost btn-sm"
-     href="{{ ingress_path }}/history?filter=review&amp;circuit={{ cid }}">
-    ★ Label these on History
+     href="{{ ingress_path }}/history?filter=review&amp;circuit={{ cid }}"
+     title="Picked {{ q.picked_on }} from {{ q.pool }} event{{ '' if q.pool == 1 else 's' }} under {{ health.review_bar_pct }}% sure.">
+    ★ Label {{ q.circuit_name if qs|length > 1 else 'these' }} on History
   </a>
+  {% endfor %}
 </div>
-{% endfor %}
 {% endif %}
 
 {# ── What the learning loop has been deciding, from its ledger.
      A model that has stopped improving is SILENT — a frozen fit serves exactly
      like a healthy one — so this is the one place the operator can see a run
-     of rejections. A banner, never a knob: the referee is not relaxed from
-     here. ─────────────────────────────────────────────────────────────── #}
-{% if health and health.learning %}
-{% for cid, l in health.learning.items() %}
-<div class="fx-msg {{ 'fx-msg-warn' if (l.stalled or l.paused_by_reservation or l.tier_skipped) else 'fx-msg-ok' }}"
-     style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
-  <span>
+     of rejections. It is a muted line under the circuit's heading, not a
+     banner: a stall, a pause or a skipped tier all leave the running model
+     serving and none has a button here. Only the re-pin prompt, which asks a
+     question, gets a banner. ──────────────────────────────────────────────── #}
+{% macro learning_loud(l) -%}
+  {%- if is_admin and l.repin_suggested %}1{% endif -%}
+{%- endmacro %}
+{% macro learning_text(l, named=true) %}
     {%- if l.stalled %}
-    <strong>The learned model on {{ l.circuit_name }} has stopped improving</strong> —
+    <strong>The learned model{% if named %} on {{ l.circuit_name }}{% endif %} has stopped improving</strong> —
     the last {{ l.kept_streak }} weekly re-fits were all judged no better than the
     model already running
     {%- if l.stall_reason == 'unchanged_challenger' %}, and every one of them was the
@@ -224,23 +209,24 @@
     {{ l.pin_threshold }} of your own labels exist; you have {{ l.human_labels or 0 }}){% endif %}.
     {%- endif %}
     {%- elif l.paused_by_reservation %}
-    <strong>Re-fits of the learned model on {{ l.circuit_name }} are paused</strong> —
+    <strong>Re-fits of the learned model{% if named %} on {{ l.circuit_name }}{% endif %} are paused</strong> —
     the reference set holds back more labels than the pool can spare right now.
     Label about {{ l.reservation_shortfall or 'a few' }} more events, or re-pin a
     smaller set.
     {%- elif l.fair_fight_streak %}
-    Learned model on {{ l.circuit_name }}: {{ l.kept_streak }} new fits judged, the
+    Learned model{% if named %} on {{ l.circuit_name }}{% endif %}: {{ l.kept_streak }} new fits judged, the
     running model retained each time — reference set active.
     {%- else %}
-    Learned model on {{ l.circuit_name }}: last checked {{ (l.last_decided_at or '')[:10] }} —
+    Learned model{% if named %} on {{ l.circuit_name }}{% endif %}: last checked {{ (l.last_decided_at or '')[:10] }} —
     {%- if l.last_swapped %} a new fit took over.
     {%- elif l.last_status == 'kept' %} the running model was kept
       {%- if l.kept_streak > 1 %} ({{ l.kept_streak }} checks in a row){% endif %}.
     {%- elif l.last_status == 'pinned' %} the reference set was pinned.
     {%- else %} nothing to decide yet ({{ l.last_reason }}).
     {%- endif %}
-    {%- if l.days_since_swap is not none %}
-      Last change-over {{ l.days_since_swap }} day{{ '' if l.days_since_swap == 1 else 's' }} ago.
+    {#- after a swap the change-over IS the last check, already dated above #}
+    {%- if l.days_since_swap is not none and not l.last_swapped %}
+      Last change-over {{ 'today' if l.days_since_swap == 0 else '%d day%s ago'|format(l.days_since_swap, '' if l.days_since_swap == 1 else 's') }}.
     {%- endif %}
     {%- endif %}
     {%- if l.tier_skipped %}
@@ -269,7 +255,12 @@
     {%- if l.serving_hash %}
     <span style="opacity:.65;font-family:monospace;font-size:.85em"> model {{ l.serving_hash }}</span>
     {%- endif %}
-  </span>
+{%- endmacro %}
+{% if health and health.learning %}
+{% for cid, l in health.learning.items() if learning_loud(l) %}
+<div class="fx-msg {{ 'fx-msg-warn' if (l.stalled or l.paused_by_reservation or l.tier_skipped) else 'fx-msg-ok' }}"
+     style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+  <span>{{ learning_text(l) }}</span>
   {#- Never re-pinned silently. Same shape as the health-alert
       controls above: inline forms, CSRF, admin-only, outcome via ?msg=. #}
   {% if is_admin and l.repin_suggested %}
@@ -362,6 +353,12 @@
   </form>
   {% endif %}
 </h2>
+
+{# Routine learning-loop status; a state that wants attention is a banner up top instead. #}
+{% set l = health.learning.get(circ.circuit) if health and health.learning else none %}
+{% if l and not learning_loud(l) %}
+<p class="muted" style="margin:-4px 0 14px 0">{{ learning_text(l, named=false) }}</p>
+{% endif %}
 
 {% if circ.training_state == 'labelling' %}
   <div class="fx-labelling-callout">

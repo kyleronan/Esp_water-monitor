@@ -5,11 +5,25 @@
 Fixture labeling that survives a change in water supply, full booster-pump
 support, and a long run of accuracy work driven by audits of the add-on's
 stored events against raw Home Assistant history. (Shipped incrementally as
-dev1–dev59 — dev7/dev8 landed without a version bump; per-build detail is in
+dev1–dev60 — dev7/dev8 landed without a version bump; per-build detail is in
 git history.)
 
 ### New Features
 
+- **The review card asks about ten events a week, then goes away** — picked
+  from the past seven days, only ones the app is under 80% sure of. Answering
+  or ignoring one takes it off; nothing replaces it until next week's set.
+- **Your labels on too-slow-to-meter draws count for their look-alikes** — a
+  draw below what the meter can measure is set aside as not real use. Label two
+  of them as a fixture (an ice maker's fill, say) and draws that closely match
+  are kept as real use and named after them; remove the labels and they go back.
+- **A newly learned model re-checks the last four weeks** — including its
+  predecessors' confident calls, so a fixture you started labelling recently
+  reaches events an earlier model named before it knew that fixture.
+- **History's sparkline height is the draw's flow** — five sizes, each holding
+  about a fifth of the circuit's real events, fitted daily to your own home
+  (from 50 events, fully its own at 250); a garden hose reads full height.
+  Settings → Dev Tools shows each circuit's cut points.
 - **Tell it which fixtures you have** — a checklist under Settings → Dev Tools.
   Untick a fixture your home does not have and the add-on stops naming it:
   events it would have called that read as *Other*, and it leaves the label

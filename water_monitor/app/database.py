@@ -2937,6 +2937,7 @@ def clear_event_classification(
         _detect_pressure_restoration_phantom, _detect_low_flow_dribble,
     )
     from .artifact_calibration import load_artifact_calibration
+    from .label_twins import load_exemplars, twin_type
 
     row = _event_row(
         conn, event_id, circuit,
@@ -2961,6 +2962,7 @@ def clear_event_classification(
             min_flow_lpm=(60.0 / get_circuit_pulses_per_litre(conn, circuit)),
             true_avg_flow_lpm=row["true_avg_flow_lpm"],
             peak_flow_lpm=row["peak_flow_lpm"])
+        and not twin_type(dict(row), load_exemplars(conn, circuit))
     ) else 0
     return _apply_event_verdicts(
         conn, event_id, circuit,

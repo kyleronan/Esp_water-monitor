@@ -466,6 +466,11 @@ def _reclassify_prepare(conn: sqlite3.Connection, circuit: str, ha_tz=None,
     # Toilet physics veto — cap computed once for the whole pass.
     _toilet_cap = _db.get_toilet_flush_cap_litres(conn)
 
+    # The home's labelled below-floor draws, once per pass (label_twins).
+    from .feature_extractor import _circuit_min_flow
+    from .label_twins import load_exemplars
+    _floor_twins = load_exemplars(conn, circuit)
+
     where = "WHERE circuit = ? AND user_fixture_type IS NULL"
     qparams: list = [circuit]
     if since_ts is not None:
@@ -520,7 +525,10 @@ def _reclassify_prepare(conn: sqlite3.Connection, circuit: str, ha_tz=None,
          "match_rejection_reason",       # abstention marker mark/retract
          "match_confidence",             # so an unchanged model verdict is not
                                          # rewritten every pass
-         "active_flow_segment_count")
+         "active_flow_segment_count",
+         # the label-twin match (label_twins)
+         "duration_seconds", "volume_litres", "avg_flow_lpm",
+         "true_avg_flow_lpm", "peak_flow_lpm", "pressure_delta_psi")
         + qfeats + _SCORE_COLS))
     # With a budget, take the highest-priority slice (``_BACKLOG_ORDER_BY``:
     # released NULL-stamp rows first, newest-first, because recent events are
@@ -568,6 +576,8 @@ def _reclassify_prepare(conn: sqlite3.Connection, circuit: str, ha_tz=None,
         "regimes":            _regimes,
         "fp_library":         _fp_library,
         "toilet_cap":         _toilet_cap,
+        "floor_twins":        _floor_twins,
+        "min_flow":           _circuit_min_flow(conn, circuit),
         "baselines":          _baselines,
         "sens":               _sens,
         "score_cols":         _SCORE_COLS,
@@ -600,6 +610,7 @@ def _reclassify_chunk_sync(conn: sqlite3.Connection, circuit: str, rows: list,
     from .supply_regime import resolve_regime_for_ts
     from .anomaly_baseline import (inert_verdict, is_judged, load_usage_baselines,
                                    score_event_anomaly)
+    from .label_twins import twin_for
 
     softener_ids   = ctx["softener_ids"]
     washer_ids     = ctx["washer_ids"]
@@ -611,6 +622,8 @@ def _reclassify_chunk_sync(conn: sqlite3.Connection, circuit: str, rows: list,
     _regimes       = ctx["regimes"]
     _fp_library    = ctx["fp_library"]
     _toilet_cap    = ctx["toilet_cap"]
+    _floor_twins   = ctx.get("floor_twins", [])
+    _min_flow      = ctx.get("min_flow", 0.15)
     # Re-read per chunk (a cache hit when nothing changed): a verdict landing
     # mid-pass rewrites the user-taught keys and invalidates the cache, and a
     # chunk scored against the pre-verdict params would re-raise a flag the
@@ -672,6 +685,10 @@ def _reclassify_chunk_sync(conn: sqlite3.Connection, circuit: str, rows: list,
         elif r["id"] in dishwasher_ids:
             new_type, new_via = "dishwasher", "dishwasher_cycle"
             new_group = dishwasher_ids[r["id"]][1]
+        elif _floor_twins and (_twin := twin_for(dict(r), _floor_twins, _min_flow)):
+            # Below the meter floor, kept real because it matches the home's
+            # own labelled draws — named after them (label_twins).
+            new_type, new_via = _twin, "label_twin"
         else:
             feats = {f: r[f] for f in qfeats}
             try:
