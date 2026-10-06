@@ -262,12 +262,18 @@ def _fixtures_page_payload(orch, range_start_utc):
             # ones stay on the Dev Tools card: a banner about litres nothing
             # can fix is a nag, not a prompt. VISIBILITY ONLY — this surface
             # reports the litres; it applies no volume policy of its own.
+            # Spans younger than AUTO_CLEANUP_GRACE are left to the hourly
+            # cleanup (reprocess.remove_redundant_reconstructions) first.
             try:
+                from datetime import datetime, timezone
                 from ..overlap_guard import summarize_overlap_groups
-                from ..reprocess import _SPLIT_LOOKBACK_H
+                from ..reprocess import (AUTO_CLEANUP_GRACE, _SPLIT_LOOKBACK_H,
+                                         _parse_utc)
+                _cut = datetime.now(timezone.utc) - AUTO_CLEANUP_GRACE
                 _og = [g for g in summarize_overlap_groups(
                             orch.db, cid, retention_hours=_SPLIT_LOOKBACK_H)
-                       if g["state"] != "resolved" and g["within_retention"]]
+                       if g["state"] != "resolved" and g["within_retention"]
+                       and _parse_utc(g["span_end"]) <= _cut]
                 if _og:
                     health_ctx["overlaps"][cid] = {
                         "circuit_name": circ.get("display_name") or cid,

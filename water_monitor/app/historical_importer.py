@@ -40,8 +40,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .config import AddonConfig, CircuitConfig
 from .event_detector import RawEvent, CircuitEventDetector as _CED
-# CONTAINMENT_FRACTION / contained_fraction live with _split_period_around_rows
-# in importer_periods; the threshold is pinned to overlap_guard's there.
 from .overlap_guard import OVERLAP_NEGLIGIBLE_L, VOLUME_COVERAGE_FRACTION
 from . import importer_periods as _periods
 from .importer_periods import _is_gap_marker, _parse_ts
@@ -169,11 +167,14 @@ class HistoricalImporter:
 
     MAX_BACKFILL_DAYS: int = 10
     CHECK_INTERVAL_MINUTES: int = 30
+    # A catch-up leaves periods that ended this recently for the next pass, so the
+    # live row for the same draw is stored first. Generous: costs one pass of delay.
+    CATCH_UP_SETTLE_S: float = 300.0
     MERGE_GAP_SECONDS: int = 15       # bridge flow_pulse_onset gaps shorter than this
     MIN_DURATION_SECONDS: float = 3.0
-    # Containment rule (docs/PIPELINE.md "Duplicate gate"): a period that CONTAINS
-    # stored rows is dropped when they hold >= CONTAINED_ROWS_COVERAGE of its water,
-    # else split AROUND them so only unrecorded water becomes an event. Runs before
+    # Containment rule (docs/PIPELINE.md "Duplicate gate"): a period whose flow lies
+    # >= CONTAINED_ROWS_COVERAGE inside the spans of stored rows is dropped, else
+    # split AROUND them so only unrecorded water becomes an event. Runs before
     # find_overlapping_event (whose coverage block stays as defence in depth).
     # Remainders under the negligible floor, holding no flow-rate fragment (a
     # pressure sag tail is not a draw), or past the cap are dropped, never written.
@@ -368,6 +369,25 @@ class HistoricalImporter:
                     flow_rate_hist, start, end),
                 "fetch_failed": False, "gappy": gappy}
 
+    async def flow_rate_history(
+        self, circuit: str, start: datetime, end: datetime,
+    ) -> Optional[List[Dict]]:
+        """The circuit's flow-rate history over [start, end], or None when it
+        cannot be trusted: no flow sensor, a failed fetch, or recorder-gap
+        markers in the window."""
+        cfg = self._cfg.get_circuit(circuit)
+        if not cfg or not cfg.flow_sensor:
+            return None
+        try:
+            histories = await self._ha.get_history_batch([cfg.flow_sensor], start, end)
+        except Exception as exc:
+            log.warning("[%s] flow history fetch failed: %s", circuit, exc)
+            return None
+        hist = histories.get(cfg.flow_sensor, [])
+        if not hist or any(_is_gap_marker(e) for e in hist):
+            return None
+        return hist
+
     # ── Scheduled operations ──
 
     async def _backfill(self) -> None:
@@ -469,7 +489,8 @@ class HistoricalImporter:
                 start = now - timedelta(hours=2)
 
             try:
-                n, retry_from = await self._import_range(cfg, start, now)
+                n, retry_from = await self._import_range(
+                    cfg, start, now, settle_s=self.CATCH_UP_SETTLE_S)
             except Exception as exc:
                 # Checkpoint deliberately NOT advanced: the unfetched window is
                 # re-covered next tick (a swallowed failure used to advance it
@@ -675,12 +696,15 @@ class HistoricalImporter:
         cfg: CircuitConfig,
         start: datetime,
         end: datetime,
+        settle_s: float = 0.0,
     ) -> Tuple[int, Optional[datetime]]:
         """
         Fetch HA history for [start, end] and import any missing events.
         Returns (count_queued, retry_from) where retry_from is the earliest
         dropped event start if any events were lost to QueueFull — the caller
         should use it as the next catch-up checkpoint so those events are retried.
+        ``settle_s`` (catch-up only) defers periods that ended less than that
+        long ago to the next pass, folding their start into retry_from.
         RAISES on a history-fetch failure (see the fetch note below) — callers
         that loop over circuits/chunks catch per iteration and hold their
         checkpoint so the window is retried, never silently skipped.
@@ -770,6 +794,24 @@ class HistoricalImporter:
                 )
             if not periods:
                 return 0, active_since
+
+        # A draw that just ended may not be STORED yet: the live row is closing,
+        # queued, or mid-extraction, so the containment rule below cannot see it
+        # and the same water went in twice (measured: rows written 4-9 s after
+        # the live one, at the catch-up's own minute). Defer it a pass; by then
+        # the live row is on record. Held the same way as a still-active draw.
+        if settle_s:
+            cutoff = datetime.now(timezone.utc) - timedelta(seconds=settle_s)
+            fresh = [s for s, e in periods if e > cutoff]
+            if fresh:
+                periods = [(s, e) for s, e in periods if e <= cutoff]
+                active_since = (min(fresh) if active_since is None
+                                else min(active_since, min(fresh)))
+                log.debug("[%s] importer: deferring %d period(s) that ended in "
+                          "the last %.0f s to the next pass",
+                          cfg.circuit, len(fresh), settle_s)
+                if not periods:
+                    return 0, active_since
 
         log.debug("[%s] found %d candidate period(s) in history window",
                   cfg.circuit, len(periods))

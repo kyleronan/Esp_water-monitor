@@ -1804,13 +1804,16 @@ def coalesce_low_flow_events(
 # while the detector re-tags the rebuilt draws on the next pass anyway.
 _MACHINE_LABEL_SOURCES_SQL = "('anchor', 'cycle')"
 
-_MACHINE_EVENTS_IN_RANGE_WHERE = (
-    "circuit = ? AND start_ts <= ? "
-    "  AND COALESCE(end_ts, start_ts) >= ? "
-    "  AND (user_fixture_type IS NULL "
+NOT_USER_TOUCHED_SQL = (
+    "(user_fixture_type IS NULL "
     "       OR COALESCE(fixture_label_source, 'direct') IN " + _MACHINE_LABEL_SOURCES_SQL + ") "
     "  AND COALESCE(user_classified, 0) = 0 "
     "  AND COALESCE(user_ignored, 0) = 0 "
+)
+_MACHINE_EVENTS_IN_RANGE_WHERE = (
+    "circuit = ? AND start_ts <= ? "
+    "  AND COALESCE(end_ts, start_ts) >= ? "
+    "  AND " + NOT_USER_TOUCHED_SQL
 )
 
 
@@ -1969,65 +1972,90 @@ def delete_events_in_range(
     captured_rows = [dict(r) for r in rows]
     span_start = rows[0]["start_ts"]                       # earliest (ORDER BY ASC)
     span_end = max((r["end_ts"] or r["start_ts"]) for r in rows)
-    affected_days = set()
     with transaction(conn):
-        for r in rows:
-            applied = float(r["hourly_volume_applied_litres"] or 0.0)
-            bucket = r["hourly_volume_applied_bucket"]
-            if bucket and applied:
-                conn.execute(
-                    "INSERT INTO hourly_volume (circuit, hour_ts, volume_litres) "
-                    "VALUES (?, ?, ?) ON CONFLICT (circuit, hour_ts) DO UPDATE "
-                    "SET volume_litres = volume_litres + excluded.volume_litres",
-                    (circuit, bucket, -applied),
-                )
-            conn.execute(
-                "DELETE FROM training_capture_candidates WHERE event_id = ?",
-                (r["id"],))
-            # overlap_audit rows referencing this event become stale (reprocess
-            # re-creates events under NEW uuid5 ids). MARK, never delete: the
-            # rows are the durable record of where zeroed litres went.
-            # kept_event_ids is a JSON list, so a LIKE probe on the quoted id
-            # catches child references too.
-            try:
-                conn.execute(
-                    "UPDATE overlap_audit SET stale_reason = "
-                    "COALESCE(stale_reason, 'superseded_by_reprocess'), "
-                    "stale_at = COALESCE(stale_at, ?) "
-                    "WHERE wrapper_event_id = ? OR kept_event_ids LIKE ?",
-                    (datetime.now(timezone.utc).isoformat(),
-                     r["id"], f'%"{r["id"]}"%'))
-            except sqlite3.Error:
-                pass       # pre-20260801 schema
-            # The same dangling-reference problem in the two audit tables that
-            # carry an event_id with NO foreign key and no cleanup. Same policy
-            # as overlap_audit above: MARK, never delete — these are durable
-            # provenance (a shutoff that fired, a cross-talk verdict applied).
-            try:
-                stale_ts = datetime.now(timezone.utc).isoformat()
-                for _tbl in ("anomaly_shutoff_log", "cross_talk_audit"):
-                    conn.execute(
-                        f"UPDATE {_tbl} SET stale_reason = "
-                        "COALESCE(stale_reason, 'superseded_by_reprocess'), "
-                        "stale_at = COALESCE(stale_at, ?) WHERE event_id = ?",
-                        (stale_ts, r["id"]))
-            except sqlite3.Error:
-                pass       # pre-20260814 schema
-            conn.execute("DELETE FROM events WHERE id = ?", (r["id"],))
-            _reevaluate_wrappers_after_delete(conn, circuit, r["start_ts"], r["end_ts"])
-            d = local_day_of(r["start_ts"])
-            if d:
-                affected_days.add(d)
-        for day in sorted(affected_days):
-            # compute_daily_summary returns None, leaving any prior row
-            # untouched, when a day has no events left — so drop the stale
-            # inflated row explicitly.
-            if compute_daily_summary(conn, circuit, day) is None:
-                conn.execute(
-                    "DELETE FROM daily_summary WHERE circuit = ? AND day = ?",
-                    (circuit, day))
+        _delete_event_rows(conn, circuit, rows, "superseded_by_reprocess")
     return {"deleted": len(rows), "span_start": span_start, "span_end": span_end,
             "deleted_rows": captured_rows}
+
+
+def delete_machine_events_by_id(
+    conn: sqlite3.Connection, circuit: str, ids: List[str], reason: str,
+) -> List[Dict[str, Any]]:
+    """Delete these events on ``circuit`` the way ``delete_events_in_range``
+    does — ledger reversed, wrappers re-evaluated, audit rows marked ``reason``
+    — skipping any the user has touched (same filter). Single transaction.
+    Returns the deleted rows."""
+    if not ids:
+        return []
+    ph = ",".join("?" * len(ids))
+    rows = conn.execute(
+        "SELECT * FROM events WHERE circuit = ? AND " + NOT_USER_TOUCHED_SQL +
+        f"AND id IN ({ph}) ORDER BY start_ts ASC",
+        (circuit, *ids),
+    ).fetchall()
+    if rows:
+        with transaction(conn):
+            _delete_event_rows(conn, circuit, rows, reason)
+    return [dict(r) for r in rows]
+
+
+def _delete_event_rows(conn: sqlite3.Connection, circuit: str, rows,
+                       stale_reason: str) -> None:
+    """The shared delete body: inside the caller's transaction."""
+    affected_days = set()
+    for r in rows:
+        applied = float(r["hourly_volume_applied_litres"] or 0.0)
+        bucket = r["hourly_volume_applied_bucket"]
+        if bucket and applied:
+            conn.execute(
+                "INSERT INTO hourly_volume (circuit, hour_ts, volume_litres) "
+                "VALUES (?, ?, ?) ON CONFLICT (circuit, hour_ts) DO UPDATE "
+                "SET volume_litres = volume_litres + excluded.volume_litres",
+                (circuit, bucket, -applied),
+            )
+        conn.execute(
+            "DELETE FROM training_capture_candidates WHERE event_id = ?",
+            (r["id"],))
+        # overlap_audit rows referencing this event become stale (reprocess
+        # re-creates events under NEW uuid5 ids). MARK, never delete: the
+        # rows are the durable record of where zeroed litres went.
+        # kept_event_ids is a JSON list, so a LIKE probe on the quoted id
+        # catches child references too.
+        try:
+            conn.execute(
+                "UPDATE overlap_audit SET stale_reason = COALESCE(stale_reason, ?), "
+                "stale_at = COALESCE(stale_at, ?) "
+                "WHERE wrapper_event_id = ? OR kept_event_ids LIKE ?",
+                (stale_reason, datetime.now(timezone.utc).isoformat(),
+                 r["id"], f'%"{r["id"]}"%'))
+        except sqlite3.Error:
+            pass       # pre-20260801 schema
+        # The same dangling-reference problem in the two audit tables that
+        # carry an event_id with NO foreign key and no cleanup. Same policy
+        # as overlap_audit above: MARK, never delete — these are durable
+        # provenance (a shutoff that fired, a cross-talk verdict applied).
+        try:
+            stale_ts = datetime.now(timezone.utc).isoformat()
+            for _tbl in ("anomaly_shutoff_log", "cross_talk_audit"):
+                conn.execute(
+                    f"UPDATE {_tbl} SET stale_reason = COALESCE(stale_reason, ?), "
+                    "stale_at = COALESCE(stale_at, ?) WHERE event_id = ?",
+                    (stale_reason, stale_ts, r["id"]))
+        except sqlite3.Error:
+            pass       # pre-20260814 schema
+        conn.execute("DELETE FROM events WHERE id = ?", (r["id"],))
+        _reevaluate_wrappers_after_delete(conn, circuit, r["start_ts"], r["end_ts"])
+        d = local_day_of(r["start_ts"])
+        if d:
+            affected_days.add(d)
+    for day in sorted(affected_days):
+        # compute_daily_summary returns None, leaving any prior row
+        # untouched, when a day has no events left — so drop the stale
+        # inflated row explicitly.
+        if compute_daily_summary(conn, circuit, day) is None:
+            conn.execute(
+                "DELETE FROM daily_summary WHERE circuit = ? AND day = ?",
+                (circuit, day))
 
 
 def restore_deleted_events(

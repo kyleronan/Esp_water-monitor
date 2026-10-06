@@ -63,6 +63,7 @@ class MaturityRecheck:
         self._ha = ha          # HA client — needed by the §2 recorder reconcile pass
         self._orch = orch      # orchestrator — needed by the dev.38 auto-split pass
         self._auto_split_checked: set = set()   # ids dry-run-checked this process (efficiency)
+        self._redundant_checked: set = set()    # overlap spans already judged this process
         # dev50 — a daily rollup of what the auto-split actually did. The live detector
         # still welds draws into one event on a pump-held line (the pressure-dip period
         # source is importer-only), so this job is what de-bloats them: it is
@@ -199,3 +200,12 @@ class MaturityRecheck:
                 self._roll_auto_split_counter(res)
             except Exception as e:
                 log.error("[%s] auto-split error: %s", circuit, e, exc_info=True)
+            # Duplicated spans clear themselves: not behind the auto-split switch,
+            # since it only removes a rebuilt copy of water another row holds.
+            try:
+                from .reprocess import remove_redundant_reconstructions
+                await remove_redundant_reconstructions(
+                    self._orch, circuit, checked=self._redundant_checked)
+            except Exception as e:
+                log.error("[%s] duplicated-span cleanup error: %s", circuit, e,
+                          exc_info=True)

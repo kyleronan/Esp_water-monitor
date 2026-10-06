@@ -35,8 +35,6 @@ import math
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from .overlap_guard import CONTAINMENT_FRACTION, contained_fraction
-
 log = logging.getLogger(__name__)
 
 
@@ -93,53 +91,60 @@ def _split_period_around_rows(
     flow_rate_hist: List[Dict],
     flow_fragments: List[Tuple[datetime, datetime]],
 ) -> Tuple[str, List[Tuple[datetime, datetime]], Dict]:
-    """Pure decision for one reconstructed period against stored rows.
+    """Pure decision for one reconstructed period against the stored rows that
+    intersect it, judged by WHERE THE WATER FLOWED, not by how the spans line up.
 
-    Returns ``("keep", [period], {})`` when no stored row is >=70 % inside the
-    period; ``("drop", [], info)`` when the contained rows' RAW volume reaches
-    ``CONTAINED_ROWS_COVERAGE`` of the period's integrated flow; otherwise
+    The live detector and the importer bound one draw differently: a pressure
+    trigger opens the live row up to ~35 s before any flow, and the importer's
+    envelope starts and ends its own way. So a period can lie mostly outside a
+    stored row in time while every litre of it lies inside (measured: a 4.2 L
+    flush stored twice, 26 s of a 43 s period overlapping). A one-meter circuit
+    integrates all flow inside a stored row's span into that row, so the flow
+    over the union of the intersecting spans, clipped to the period, is water
+    already on record.
+
+    Returns ``("keep", [period], {})`` when no stored row intersects;
+    ``("drop", [], info)`` when the recorded flow reaches
+    ``CONTAINED_ROWS_COVERAGE`` of the period's; otherwise
     ``("split", remainders, info)`` — the flow-rate fragments lying in the parts
-    of the period NOT covered by the union of the contained rows, clipped to
-    those gaps and re-merged with ``MERGE_GAP_SECONDS`` (a gap is not a draw; a
-    pressure sag tail alone is not a draw), each kept only if it lasts
-    ``MIN_DURATION_SECONDS`` and integrates to at least
-    ``CONTAINED_REMAINDER_MIN_L``; the ``MAX_REMAINDERS_PER_PERIOD`` largest by
-    volume survive, returned in time order."""
+    of the period NOT covered by that union, clipped to those gaps and re-merged
+    with ``MERGE_GAP_SECONDS`` (a gap is not a draw; a pressure sag tail alone is
+    not a draw), each kept only if it lasts ``MIN_DURATION_SECONDS`` and
+    integrates to at least ``CONTAINED_REMAINDER_MIN_L``; the
+    ``MAX_REMAINDERS_PER_PERIOD`` largest by volume survive, in time order."""
     ps, pe = period
-    contained: List[Tuple[datetime, datetime, float]] = []
+    spans: List[Tuple[datetime, datetime]] = []
     for r in rows:
         s0 = _parse_ts(r.get("start_ts"))
         e0 = _parse_ts(r.get("end_ts"))
         if s0 is None or e0 is None or e0 <= s0:
             continue
-        # The guard's own threshold, not a second copy of the number: this is
-        # the same containment question over the same spans, so it must move
-        # with _CONTAINMENT_FRACTION.
-        if contained_fraction((s0, e0), (ps, pe)) >= CONTAINMENT_FRACTION:
-            contained.append((s0, e0, float(r.get("volume_litres") or 0.0)))
-    if not contained:
+        cs, ce = max(s0, ps), min(e0, pe)
+        if ce > cs:
+            spans.append((cs, ce))
+    if not spans:
         return "keep", [period], {}
-    # top-level rows only: a row nested inside another contained row is the
-    # same water again and must not inflate the stored total.
-    contained.sort(key=lambda t: (t[0], -(t[1] - t[0]).total_seconds()))
-    top: List[Tuple[datetime, datetime, float]] = []
-    for s0, e0, v in contained:
-        if top and s0 >= top[-1][0] and e0 <= top[-1][1]:
-            continue
-        top.append((s0, e0, v))
-    stored_l = sum(v for _, _, v in top)
-    period_l = _flow_volume_in_period(p, flow_rate_hist, ps, pe)
-    info: Dict = {"n_rows": len(top), "stored_l": round(stored_l, 3),
-                  "period_l": round(period_l, 3), "kept_l": 0.0, "dropped": 0}
-    if period_l <= 0.0 or stored_l >= p.CONTAINED_ROWS_COVERAGE * period_l:
-        return "drop", [], info
-    # complement of the union of the top-level spans inside the period
+    spans.sort(key=lambda t: (t[0], -(t[1] - t[0]).total_seconds()))
+    # n_rows counts top-level rows only: one nested inside another is the same
+    # water again. The union below is what the volume is measured over.
+    n_top = 0
+    top_end: Optional[datetime] = None
     merged: List[List[datetime]] = []
-    for s0, e0, _ in top:
+    for s0, e0 in spans:
+        if top_end is None or e0 > top_end:
+            n_top += 1
+            top_end = e0
         if merged and s0 <= merged[-1][1]:
             merged[-1][1] = max(merged[-1][1], e0)
         else:
             merged.append([s0, e0])
+    stored_l = sum(_flow_volume_in_period(p, flow_rate_hist, s0, e0)
+                   for s0, e0 in merged)
+    period_l = _flow_volume_in_period(p, flow_rate_hist, ps, pe)
+    info: Dict = {"n_rows": n_top, "stored_l": round(stored_l, 3),
+                  "period_l": round(period_l, 3), "kept_l": 0.0, "dropped": 0}
+    if period_l <= 0.0 or stored_l >= p.CONTAINED_ROWS_COVERAGE * period_l:
+        return "drop", [], info
     gaps: List[Tuple[datetime, datetime]] = []
     cursor = ps
     for s0, e0 in merged:

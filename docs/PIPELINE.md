@@ -283,14 +283,26 @@ start — nothing is zeroed because nothing is ever stored.
   or a manual range.
 - **Sources:** `flow_pulse_onset` ON/OFF transitions first (bridging gaps < 15 s of turbine chatter),
   then a sustained-flow-threshold fallback.
-- **Containment rule (dev56, runs first):** a reconstructed period that *contains* rows already
-  stored (≥70 % of a row's span inside it) is not new water. If those rows' raw volume reaches
-  `VOLUME_COVERAGE_FRACTION` (0.9) of the period's integrated flow it is **dropped**; otherwise it is
+- **Catch-up settle (dev61):** the periodic catch-up leaves periods that ended in the last
+  `CATCH_UP_SETTLE_S` (300 s) to the next pass, holding the checkpoint at their start — the live
+  row for the same draw may still be closing, queued or mid-extraction, invisible to the rule below.
+- **Containment rule (dev56, by flow since dev61, runs first):** the flow integrated over the union
+  of every stored row intersecting a reconstructed period (clipped to it) is water already on
+  record — judged by where the water flowed, not by span shape, because a pressure-triggered live
+  row opens up to ~35 s before flow and the two records of one draw never line up. If that reaches
+  `VOLUME_COVERAGE_FRACTION` (0.9) of the period's flow it is **dropped**; otherwise it is
   **split around them** and only flow-rate fragments in the uncovered gaps come back — each re-merged
   with the 15 s gap rule, ≥ `MIN_DURATION_SECONDS`, ≥ `OVERLAP_NEGLIGIBLE_L` (0.20 L), at most 10 per
   period (a gap is not a draw; a pressure sag tail alone is not a draw). Log lines: `importer:
   dropping … already account for` / `importer: split … remainder(s) kept`. `dry_run_reconstruction`
   is NOT split (the reprocess probe compares raw history against stored rows itself).
+- **Duplicated-span cleanup (dev61, hourly, `reprocess.remove_redundant_reconstructions`):** the
+  same verdict asked again once every row is stored. For each unresolved overlap group inside the
+  recorder window and settled 60 min, a history-rebuilt member (`start_trigger='flow'`, no
+  `other_valve_open_source`) that no user touched is deleted when the other members' spans hold
+  ≥ 0.9 of its flow and history re-integrates ≥ 0.9 of its own volume; longest first, each judged
+  against what is still kept. Live rows are never removed. Log line: `duplicated span … removed`.
+  The Water Use banner waits `AUTO_CLEANUP_GRACE` (2 h) so it names only what this could not clear.
 - **Duplicate gate:** a period overlapping an existing event by ≥30 s (or ≥10 s **and** ≥80% of the
   shorter) is skipped — safe to re-run. The 2026-05 "incoming ≥ 3× an unlabeled stub may insert"
   heal is judged over the WHOLE candidate set since dev55 (blocks once stubs cover ≥50 % of the

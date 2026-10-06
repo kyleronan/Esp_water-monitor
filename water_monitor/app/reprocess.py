@@ -22,8 +22,9 @@ from .config import DB_PATH
 from .detector_validation import HA_HIGH_FIDELITY_DAYS
 from .event_rules import NOT_ARTIFACT_SQL
 from .feature_extractor import SPARSE_ENVELOPE_REASON
-from .overlap_guard import VOLUME_COVERAGE_FRACTION
-from .database import (delete_events_in_range, find_overlapping_event,
+from .overlap_guard import VOLUME_COVERAGE_FRACTION, summarize_overlap_groups
+from .database import (NOT_USER_TOUCHED_SQL, delete_events_in_range,
+                       delete_machine_events_by_id, find_overlapping_event,
                        get_home_profile, get_write_lock, preview_events_in_range,
                        restore_deleted_events, run_db, run_isolated_write)
 
@@ -527,3 +528,92 @@ async def auto_split_merged_events(
                  circuit, scanned, split, skipped, len(memos))
     return {"scanned": scanned, "split": split, "skipped": skipped,
             "memoed": len(memos)}
+
+
+# ── redundant reconstructions ────────────────────────────────────────────────
+# The safety net behind the importer's containment rule. A row the importer
+# rebuilt from history is always flow-triggered, and history carries no valve
+# state, so the live detector's other_valve_open provenance is never set on it.
+_RECONSTRUCTED_SQL = "start_trigger = 'flow' AND other_valve_open_source IS NULL"
+REDUNDANT_RECONSTRUCTION_REASON = "redundant_reconstruction"
+_REDUNDANT_SPANS_PER_PASS: int = 10
+# Settle, then one hourly pass: the Water Use banner waits this long so it only
+# names spans this sweep could not clear.
+AUTO_CLEANUP_GRACE = timedelta(minutes=_SPLIT_SETTLE_MIN + 60)
+
+
+def _overlap_members(conn: sqlite3.Connection, circuit: str, ids: list) -> list:
+    ph = ",".join("?" * len(ids))
+    return [dict(r) for r in conn.execute(
+        "SELECT id, start_ts, end_ts, volume_litres, "
+        f"  (({_RECONSTRUCTED_SQL}) AND ({NOT_USER_TOUCHED_SQL})) AS removable "
+        f"FROM events WHERE circuit = ? AND id IN ({ph})", (circuit, *ids))]
+
+
+async def remove_redundant_reconstructions(
+    orch: Any, circuit: str, checked: Optional[Set[tuple]] = None,
+) -> Dict[str, Any]:
+    """Delete history-rebuilt rows whose water other stored rows already hold —
+    the importer's containment verdict asked again once every row is stored, so
+    a duplicated span clears itself instead of waiting for "Rebuild duplicated
+    spans". Only unresolved spans inside the recorder window and settled
+    ``_SPLIT_SETTLE_MIN``. Never a live-detector row (it carries the waveform),
+    never one the user labelled, classified or ignored, and only when history
+    re-integrates >= ``_SPLIT_MIN_VOLUME_COVERAGE`` of the row's own volume.
+    Longest first, each judged against the rows still kept, so a rebuilt wrapper
+    goes before the pieces inside it. ``checked`` skips spans already judged
+    this process. Returns ``{"spans", "removed", "litres"}``."""
+    out: Dict[str, Any] = {"spans": 0, "removed": 0, "litres": 0.0}
+    importer = getattr(orch, "historical_importer", None)
+    if importer is None:
+        return out
+    if checked is None:
+        checked = set()
+    groups = await run_db(summarize_overlap_groups, orch.db, circuit,
+                          retention_hours=_SPLIT_LOOKBACK_H)
+    settled = datetime.now(timezone.utc) - timedelta(minutes=_SPLIT_SETTLE_MIN)
+    todo = [g for g in groups
+            if g["state"] != "resolved" and g["within_retention"]
+            and _parse_utc(g["span_end"]) <= settled
+            and tuple(g["member_ids"]) not in checked]
+    for g in todo[:_REDUNDANT_SPANS_PER_PASS]:
+        key = tuple(g["member_ids"])
+        members = await run_db(_overlap_members, orch.db, circuit, g["member_ids"])
+        cands = sorted((m for m in members if m["removable"]),
+                       key=lambda m: _parse_utc(m["start_ts"]) - _parse_utc(m["end_ts"]))
+        if not cands:
+            checked.add(key)
+            continue
+        hist = await importer.flow_rate_history(
+            circuit, _parse_utc(g["span_start"]) - timedelta(minutes=10),
+            _parse_utc(g["span_end"]) + timedelta(minutes=1))
+        if hist is None:
+            continue                    # fetch failed or gappy — retry next pass
+        frags = importer._rate_to_periods(hist)
+        kept, doomed = list(members), []
+        for c in cands:
+            others = [m for m in kept if m["id"] != c["id"]]
+            action, _subs, info = importer._split_period_around_rows(
+                (_parse_utc(c["start_ts"]), _parse_utc(c["end_ts"])), others, hist, frags)
+            if (action == "drop" and info["period_l"] > 0
+                    and info["period_l"] >= _SPLIT_MIN_VOLUME_COVERAGE
+                    * float(c["volume_litres"] or 0.0)):
+                doomed.append(c)
+                kept = others
+        checked.add(key)
+        out["spans"] += 1
+        if not doomed:
+            continue
+        ids = [d["id"] for d in doomed]
+        deleted = await run_isolated_write(
+            DB_PATH, lambda c: delete_machine_events_by_id(
+                c, circuit, ids, REDUNDANT_RECONSTRUCTION_REASON))
+        litres = sum(float(d.get("volume_litres") or 0.0) for d in deleted or [])
+        out["removed"] += len(deleted or [])
+        out["litres"] += litres
+        log.info("[%s] duplicated span %s..%s: removed %d history-rebuilt event(s) "
+                 "(%.2f L) whose water other events already hold",
+                 circuit, g["span_start"][:19], g["span_end"][11:19],
+                 len(deleted or []), litres)
+    out["litres"] = round(out["litres"], 2)
+    return out

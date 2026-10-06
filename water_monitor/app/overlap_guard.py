@@ -64,9 +64,9 @@ OVERLAP_DUPLICATE_REASON = "overlap_duplicate"
 # 0.70, not 0.90: the verified 10:03 incident wrapper only contains 77% of the
 # real flush's span (the genuine draw's tail extends past the wrapper's close).
 # Volume reconciliation is the strong second gate; 0.70 span containment matches
-# the observed physics. Public spelling — the importer's containment rule
-# (historical_importer._split_period_around_rows) asks the SAME question of the
-# same spans and must read this threshold from here, not keep its own copy.
+# the observed physics. The importer's containment rule does NOT use it: it
+# judges by flow inside stored spans, since span shape is what differs between
+# the live and reconstructed records of one draw.
 CONTAINMENT_FRACTION: float = 0.70
 _CONTAINMENT_FRACTION = CONTAINMENT_FRACTION
 _VOL_TOLERANCE = 0.40
@@ -134,11 +134,6 @@ def _contained_fraction(inner, outer) -> float:
     if dur <= 0:
         return 1.0 if outer[0] <= inner[0] <= outer[1] else 0.0
     return max(0.0, (hi - lo).total_seconds()) / dur
-
-
-def contained_fraction(inner, outer) -> float:
-    """Public spelling of ``_contained_fraction`` for the importer."""
-    return _contained_fraction(inner, outer)
 
 
 def _union_coverage(outer, spans) -> float:

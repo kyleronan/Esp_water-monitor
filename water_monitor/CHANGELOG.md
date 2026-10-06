@@ -5,7 +5,7 @@
 Fixture labeling that survives a change in water supply, full booster-pump
 support, and a long run of accuracy work driven by audits of the add-on's
 stored events against raw Home Assistant history. (Shipped incrementally as
-dev1–dev60 — dev7/dev8 landed without a version bump; per-build detail is in
+dev1–dev61 — dev7/dev8 landed without a version bump; per-build detail is in
 git history.)
 
 ### New Features
@@ -480,6 +480,15 @@ makes the add-on survive that.
   one. The list is now built as plain text that cannot execute.
 
 ### Bug Fixes
+
+- **Catching up on history no longer adds a draw the live recording already
+  has** — the two record one draw with different start and end times (the live
+  one often starts when the pressure drops, before any water flows), so the
+  duplicate check, which compared times, let a second copy through a few times
+  a week. It now checks where the water actually flowed, and waits a few
+  minutes after a draw ends before looking. Any copy that still gets in is
+  removed by an hourly cleanup, so Water Use no longer asks you to rebuild
+  them; your labelled events are never touched — dev61.
 
 - **The same water is no longer recorded twice on one circuit** — a dishwasher
   run could be stored both as the individual fills the add-on saw live and as a
