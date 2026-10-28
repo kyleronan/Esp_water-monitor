@@ -176,6 +176,8 @@ def release_settle_window(conn: sqlite3.Connection, circuit: str,
         "WHERE circuit = ? AND start_ts >= ? AND user_fixture_type IS NULL "
         "  AND verdict_stamp IS NOT NULL",
         (circuit, cutoff))
+    # run_db rolls back anything a callable leaves open; commit or this is undone.
+    conn.commit()
     return cur.rowcount or 0
 
 

@@ -2453,6 +2453,10 @@ def reprocess_event_exclusion_verdicts(conn: sqlite3.Connection) -> dict:
     except Exception as e:
         log.warning("leak-test refill reconcile failed (non-fatal): %s", e)
         refill = {"tagged": 0}
+    # The scans commit only when they change something, so a pass with nothing
+    # to do still holds its no-op UPDATEs' transaction; close it rather than
+    # leave run_db's leak guard to roll it back on every boot.
+    conn.commit()
 
     return {"flagged": flagged, "dribbles_flagged": dribbles_flagged,
             "dribbles_restored": dribbles_restored,
