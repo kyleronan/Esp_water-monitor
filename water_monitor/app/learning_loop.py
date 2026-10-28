@@ -1076,7 +1076,12 @@ def _invalidate(conn: sqlite3.Connection, circuit: str,
     ids = scoped_invalidation_ids(conn, circuit, art.threshold, art.trained_at)
     if not ids:
         return 0
-    return invalidate_verdict_stamps(conn, ids)
+    n = invalidate_verdict_stamps(conn, ids)
+    # Commit here: run_db rolls back whatever a callable leaves open, and
+    # retrain has no later write to carry this one — uncommitted, every swap's
+    # re-check was silently undone.
+    conn.commit()
+    return n
 
 
 # ── the decision ledger ─────────────────────────────────────────────────────

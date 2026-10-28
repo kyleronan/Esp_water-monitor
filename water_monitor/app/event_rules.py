@@ -207,6 +207,12 @@ _DW_CYCLE_MIN_MEMBERS: int = 3          # >=3 chained gentle fills == a cycle
 # thresholds weakly identified at n=50). STRUCTURAL — never in RULE_DEFAULTS.
 _DW_CYCLE_MAX_FLOW_VARIABILITY: float = 1.6
 _DW_CYCLE_MIN_STEADY_FRACTION: float = 0.4
+# A dishwasher inlet valve runs at >= ~1.9 L/min; a humidifier or ice-maker
+# solenoid trickles at 0.4-1 L/min, and its 0.4 L top-ups every ~7 min chained
+# into fake cycles. Measured 2026-10-28: labelled dishwasher plateau min 1.86
+# (217), humidifier p95 1.24 (72); 1.0 drops 82 humidifier draws since its
+# onset and no dishwasher-labelled member in the home's history. STRUCTURAL.
+_DW_CYCLE_MIN_PLATEAU_LPM: float = 1.0
 
 _SHOWER_BIG_VOL_L: float = 30.0
 _SHOWER_BIG_DUR_S: float = 300.0
@@ -583,7 +589,7 @@ def detect_dishwasher_cycles(
     rows = _detector_rows(
         conn, "id, start_ts, duration_seconds, volume_litres, peak_flow_lpm, "
         "has_pressure_transient, pressure_delta_psi, flow_variability, "
-        "steady_state_fraction",
+        "steady_state_fraction, flow_plateau_lpm",
         "circuit = ? AND COALESCE(excluded_from_training, 0) = 0 AND " + NOT_ARTIFACT_SQL,
         [circuit], since_ts, limit)
 
@@ -605,6 +611,11 @@ def detect_dishwasher_cycles(
         if fv is not None and fv > _DW_CYCLE_MAX_FLOW_VARIABILITY:
             continue
         if ssf is not None and ssf < _DW_CYCLE_MIN_STEADY_FRACTION:
+            continue
+        # A slow solenoid trickle (humidifier, ice maker) is not a dishwasher
+        # fill however rhythmic; NULL (no waveform) passes like the gates above.
+        plateau = r["flow_plateau_lpm"]
+        if plateau is not None and plateau < _DW_CYCLE_MIN_PLATEAU_LPM:
             continue
         feats = {"volume_litres": v, "duration_seconds": r["duration_seconds"],
                  "peak_flow_lpm": pk, "has_pressure_transient": r["has_pressure_transient"],

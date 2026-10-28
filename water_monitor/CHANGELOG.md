@@ -5,7 +5,7 @@
 Fixture labeling that survives a change in water supply, full booster-pump
 support, and a long run of accuracy work driven by audits of the add-on's
 stored events against raw Home Assistant history. (Shipped incrementally as
-dev1–dev61 — dev7/dev8 landed without a version bump; per-build detail is in
+dev1–dev62 — dev7/dev8 landed without a version bump; per-build detail is in
 git history.)
 
 ### New Features
@@ -480,6 +480,14 @@ makes the add-on survive that.
   one. The list is now built as plain text that cannot execute.
 
 ### Bug Fixes
+
+- **A new learned model re-checks the events it might now answer
+  differently** — that list was being discarded when the model changed over
+  (weekly or Re-fit now), so older verdicts stayed as they were — dev62.
+
+- **A humidifier's or ice maker's small, regular top-ups are no longer read as
+  a dishwasher run** — fills slower than 1 L/min no longer count towards a
+  dishwasher cycle; a real dishwasher fill runs at about 2 L/min or more — dev62.
 
 - **Catching up on history no longer adds a draw the live recording already
   has** — the two record one draw with different start and end times (the live
