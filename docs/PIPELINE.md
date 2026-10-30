@@ -1031,6 +1031,13 @@ what makes that acceptable — a miss lands within days rather than never. It
 also means this gets better for free when the DBSTREAM assignment step is
 replaced.
 
+A cluster with more than `_LABEL_PUSH_MAX_PEERS` (200) such peers is too
+coarse to mean "similar" — one Main cluster held ~6,800 unlabelled events in
+Oct 2026 and each label re-opened ~4,550 of them. There a label releases only
+its 200 nearest peers in the k-NN's own feature space (same features, scales
+and log transform), ranked over released peers too, so a run of similar labels
+keeps naming the same neighbourhood (dev64).
+
 **An event inside the settle horizon is never stamped.** `maturity_recheck`
 re-runs this pass hourly over the last 6 h because cycle context arrives
 *after* an event closes — a dishwasher's third fill is what lets the cycle
@@ -1048,10 +1055,14 @@ the rest drains overnight at ~13 s an hour. Every capped pass logs what it
 left queued — a backlog that drains silently is one nobody can tell has
 stalled.
 
-Priority inside the budget is **who is waiting**: rows with a NULL stamp
-(new events, ones still settling, peers freed by a label you just saved) sort
-ahead of merely-stale ones, then newest first. Without that ordering, saving a
-label during a long drain would appear to do nothing for hours.
+The budget is split between **two queues**: rows with a NULL stamp (new
+events, ones still settling, peers freed by a label you just saved) newest
+first, and merely-stale ones oldest first. Each is guaranteed half of every
+slice and takes the other's unused share (`_backlog_split`). Released rows
+need their half or saving a label during a long drain would appear to do
+nothing for hours; stale rows need theirs or labelling starves the deploy's
+re-check — before dev64 NULL went first outright, and an evening of labelling
+kept dev62's dishwasher fix from reaching a single older draw.
 
 The cap is opt-in, so operator-triggered work stays immediate: a rules re-fit
 or a manual reprocess re-derives the whole circuit in one pass, because there

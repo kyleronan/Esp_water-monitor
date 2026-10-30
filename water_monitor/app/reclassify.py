@@ -127,15 +127,19 @@ def invalidate_cluster_verdict_stamps(conn: sqlite3.Connection, circuit: str,
                                       event_id: str) -> int:
     """A new label PUSHES a re-check to its cluster — the events a new exemplar
     can plausibly move — rather than releasing the whole circuit, keeping the
-    work proportional to the change.
+    work proportional to the change. A cluster with more than
+    ``_LABEL_PUSH_MAX_PEERS`` such peers is too coarse to mean "similar", so
+    only the label's nearest peers in k-NN feature space are released.
 
     The labelled event itself needs no releasing (the pass only visits
     ``user_fixture_type IS NULL``). Returns the number of peers released; zero
     is normal — no cluster means no known neighbours — and the weekly
     unfiltered pass is the backstop for anything this misses.
     """
+    feats = _db._SIGNATURE_KNN_ACTIVE_FEATURES
     row = conn.execute(
-        "SELECT cluster_id FROM events WHERE id = ? AND circuit = ?",
+        "SELECT cluster_id, " + ", ".join(feats) + " FROM events "
+        "WHERE id = ? AND circuit = ?",
         (event_id, circuit)).fetchone()
     if row is None or row[0] is None:
         return 0
@@ -145,18 +149,50 @@ def invalidate_cluster_verdict_stamps(conn: sqlite3.Connection, circuit: str,
     # tiers) returns the identical verdict no matter how many labels exist.
     # Everything else — an abstention, a fingerprint hit, a k-NN hit — was
     # decided by evidence a new exemplar can move, so it is released.
-    cur = conn.execute(
-        "UPDATE events SET verdict_stamp = NULL "
-        "WHERE circuit = ? AND cluster_id = ? AND user_fixture_type IS NULL "
-        "  AND verdict_stamp IS NOT NULL "
+    movable = (
+        "circuit = ? AND cluster_id = ? AND user_fixture_type IS NULL "
         # LIKE 'rule%' rather than a list: the tier emits rule_toilet,
         # rule_shower, rule_dishwasher and gains more as rules are added, and
         # an enumeration would silently stop covering the new ones.
-        "  AND (matched_via IS NULL OR (matched_via NOT LIKE 'rule%' "
-        "       AND matched_via NOT IN ('softener_session','washer_cycle',"
-        "                               'dishwasher_cycle')))",
-        (circuit, row[0]))
-    return cur.rowcount or 0
+        "AND (matched_via IS NULL OR (matched_via NOT LIKE 'rule%' "
+        "     AND matched_via NOT IN ('softener_session','washer_cycle',"
+        "                             'dishwasher_cycle')))")
+    peers = conn.execute(
+        "SELECT id, start_ts, verdict_stamp, " + ", ".join(feats) +
+        " FROM events WHERE " + movable, (circuit, row[0])).fetchall()
+    if len(peers) > _LABEL_PUSH_MAX_PEERS:
+        # A mega-cluster: release only the label's nearest neighbours. Ranked
+        # over ALL movable peers, already-released ones included, so a run of
+        # similar labels keeps naming the same neighbourhood, not a fresh batch.
+        label = dict(zip(feats, tuple(row)[1:]))
+        peers.sort(key=lambda p: p[1] or "", reverse=True)    # ties: newest first
+        peers.sort(key=lambda p: _push_distance(label, dict(zip(feats, tuple(p)[3:]))))
+        peers = peers[:_LABEL_PUSH_MAX_PEERS]
+    return invalidate_verdict_stamps(conn, [p[0] for p in peers if p[2] is not None])
+
+
+# A label releases at most this many cluster peers — half an hourly slice. One
+# cluster has held most of the circuit since Sept and each label re-opened
+# ~4,550 rows, which kept the backlog from ever draining while someone labelled.
+_LABEL_PUSH_MAX_PEERS: int = 200
+
+
+def _push_distance(label: Dict[str, Any], peer: Dict[str, Any]) -> float:
+    """The k-NN's own distance (same features, scales and log transform), over
+    the dimensions both rows carry. No shared dimension → infinity."""
+    sq, dims = 0.0, 0
+    logf = _db._SIGNATURE_KNN_ACTIVE_LOG_FEATURES
+    for f in _db._SIGNATURE_KNN_ACTIVE_FEATURES:
+        a, b = label.get(f), peer.get(f)
+        if f == _db._PRESSURE_FEATURE:
+            a, b = _db._valid_pressure(a), _db._valid_pressure(b)
+        if a is None or b is None:
+            continue
+        d =(_db._knn_transform(f, a, logf) - _db._knn_transform(f, b, logf)) \
+            / _db._SIGNATURE_KNN_ACTIVE_SCALES.get(f, 1.0)
+        sq += d * d
+        dims += 1
+    return (sq / dims) ** 0.5 if dims else float("inf")
 
 
 def release_settle_window(conn: sqlite3.Connection, circuit: str,
@@ -292,13 +328,21 @@ def _match_bucket(via: Optional[str]) -> str:
     return "rule_matched"          # rule_*, washer_cycle, dishwasher_cycle, composite
 
 
-# The backlog slice: NULL-stamp rows first and newest-first (someone is
-# waiting on those); the stale-stamp group OLDEST-first so the historical tail
-# drains front-to-back instead of being starved by fresh invalidations. A
-# constant so the ordering rule is unit-testable without the whole context.
-_BACKLOG_ORDER_BY = ("(verdict_stamp IS NOT NULL), "
-                     "CASE WHEN verdict_stamp IS NULL THEN start_ts END DESC, "
-                     "start_ts ASC")
+# The backlog slice draws from two queues. NULL-stamp rows (new, settling,
+# freed by a label) go newest-first: someone is waiting on those. Stale-stamp
+# rows (a deploy or a re-fit re-opened them) go oldest-first so the historical
+# tail drains front-to-back. The stale queue is GUARANTEED this share of every
+# slice: with NULL first outright, a label re-opening ~4,550 rows an hour kept
+# a deploy's re-check from ever reaching history (2026-10-28).
+_VERDICT_BACKLOG_STALE_SHARE: float = 0.5
+
+
+def _backlog_split(null_n: int, stale_n: int, limit: int) -> tuple:
+    """(null_take, stale_take) for one slice. Either queue gets the other's
+    unused share, so a lone queue still drains at the full rate."""
+    stale_take = min(stale_n, max(limit - null_n,
+                                  int(limit * _VERDICT_BACKLOG_STALE_SHARE)))
+    return min(null_n, limit - stale_take), stale_take
 
 
 def _forced_reopen_allowed(since_ts: Optional[str]) -> bool:
@@ -321,7 +365,7 @@ _SYNC_YIELD_EVERY_ROWS: int = 40
 # add-on. ~400 costs a few seconds and drains 5,400 events overnight.
 #
 # Deliberately released rows (NULL stamp — new events, the settle window, a
-# label's cluster push) are prioritised inside this budget.
+# label's cluster push) share it with stale ones (``_backlog_split``).
 _VERDICT_BACKLOG_PER_PASS: int = 400
 
 # The chunk budget, in SECONDS: how long one run_db call may hold the single DB
@@ -532,30 +576,32 @@ def _reclassify_prepare(conn: sqlite3.Connection, circuit: str, ha_tz=None,
          "duration_seconds", "volume_litres", "avg_flow_lpm",
          "true_avg_flow_lpm", "peak_flow_lpm", "pressure_delta_psi")
         + qfeats + _SCORE_COLS))
-    # With a budget, take the highest-priority slice (``_BACKLOG_ORDER_BY``:
-    # released NULL-stamp rows first, newest-first, because recent events are
-    # what the operator opens) and leave the rest for the next pass. The
-    # subquery picks the slice; the outer ORDER BY start_ts keeps the row
-    # loop's ascending order, so batching changes WHICH rows a pass sees, never
-    # how it processes them.
+    # With a budget, take one slice (``_backlog_split``) and leave the rest for
+    # the next pass. The subquery picks the slice; the outer ORDER BY start_ts
+    # keeps the row loop's ascending order, so batching changes WHICH rows a
+    # pass sees, never how it processes them.
     backlog_remaining = 0
     if backlog_limit is not None and backlog_limit > 0:
-        total = conn.execute("SELECT COUNT(*) FROM events " + where,
-                             qparams).fetchone()[0]
-        backlog_remaining = max(0, total - backlog_limit)
-        # Two queues, two directions. NULL-stamp rows (new, settling, freed by
-        # a label) go first and NEWEST-first. The STALE-stamp group — events a
-        # new build or a promotion re-opened — drains OLDEST-first: newest-first
-        # there lets a steady trickle of fresh invalidations push the historical
-        # tail to the back of every slice (~1,041 July events went unexamined
-        # for weeks, never reaching the front of the budget).
+        null_n, stale_n = conn.execute(
+            "SELECT COALESCE(SUM(verdict_stamp IS NULL), 0), "
+            "       COALESCE(SUM(verdict_stamp IS NOT NULL), 0) FROM events " + where,
+            qparams).fetchone()
+        null_take, stale_take = _backlog_split(null_n, stale_n, backlog_limit)
+        backlog_remaining = null_n + stale_n - null_take - stale_take
+        # Stale oldest-first: newest-first there let a steady trickle of fresh
+        # invalidations push the historical tail to the back of every slice
+        # (~1,041 July events went unexamined for weeks).
         rows = conn.execute(
             "SELECT " + ", ".join(select_cols) + " FROM events "
-            "WHERE id IN (SELECT id FROM events " + where + " "
-            "             ORDER BY " + _BACKLOG_ORDER_BY + " "
-            "             LIMIT ?) "
+            "WHERE id IN (SELECT id FROM (SELECT id FROM events " + where +
+            "               AND verdict_stamp IS NULL "
+            "               ORDER BY start_ts DESC LIMIT ?) "
+            "             UNION ALL "
+            "             SELECT id FROM (SELECT id FROM events " + where +
+            "               AND verdict_stamp IS NOT NULL "
+            "               ORDER BY start_ts ASC LIMIT ?)) "
             "ORDER BY start_ts",
-            qparams + [backlog_limit],
+            qparams + [null_take] + qparams + [stale_take],
         ).fetchall()
     else:
         rows = conn.execute(

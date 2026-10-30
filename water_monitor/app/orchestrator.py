@@ -872,8 +872,8 @@ class Orchestrator:
                 # legitimately invalidates every stamp, but that work needs
                 # doing eventually, not at the moment the operator wants to look
                 # at the add-on. Deliberately-released rows (settle window, new
-                # events, a label's cluster peers) sort first inside the budget,
-                # so the things someone IS waiting on land immediately.
+                # events, a label's cluster peers) share the budget with stale
+                # ones (``_backlog_split``).
                 from .reclassify import _VERDICT_BACKLOG_PER_PASS
                 r = await _timed_startup_job(
                     f"reclassify[{c.circuit}]",

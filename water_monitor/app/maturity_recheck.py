@@ -155,8 +155,7 @@ class MaturityRecheck:
             # So it drains here instead, a bounded slice per hour, alongside
             # the other quiet-time jobs this add-on already runs. Rows with a
             # NULL stamp — new events, ones still settling, peers freed by a
-            # label — sort first inside the budget, because those DO have
-            # someone waiting.
+            # label — share the budget with stale ones (``_backlog_split``).
             from .reclassify import _VERDICT_BACKLOG_PER_PASS
             b = reclassify_all_events_from_signatures(
                 conn, circuit, backlog_limit=_VERDICT_BACKLOG_PER_PASS)

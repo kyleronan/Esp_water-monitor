@@ -5,7 +5,7 @@
 Fixture labeling that survives a change in water supply, full booster-pump
 support, and a long run of accuracy work driven by audits of the add-on's
 stored events against raw Home Assistant history. (Shipped incrementally as
-dev1–dev63 — dev7/dev8 landed without a version bump; per-build detail is in
+dev1–dev64 — dev7/dev8 landed without a version bump; per-build detail is in
 git history.)
 
 ### New Features
@@ -480,6 +480,12 @@ makes the add-on survive that.
   one. The list is now built as plain text that cannot execute.
 
 ### Bug Fixes
+
+- **Labelling no longer stalls the background re-check** — each label sent
+  thousands of older draws back into the queue, so a new version's fixes never
+  reached them while you labelled. A label now re-checks only its 200 most
+  similar draws, and half of every hourly batch goes to the oldest waiting
+  draws — dev64.
 
 - **Starting the add-on re-checks the draws from the hours it was off** — that
   catch-up was being undone straight after it ran, so those draws kept the
